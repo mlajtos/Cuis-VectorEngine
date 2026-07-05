@@ -122,8 +122,8 @@ honest three-way picture on Apple Silicon:
 | build | source? | file | per-arch `__TEXT` | arch |
 |---|---|--:|--:|---|
 | **shipped stock** (Cuis distro) | none published | 178 KB | 49 KB | x86_64 + arm64 (fat) |
-| **pristine from Slang**, `-O2` | `slang/` base | 113 KB | 64 KB | arm64 |
-| **this build**, `-O2` | `slang/SlabStamping.st` | 114 KB | 64 KB | arm64 |
+| **pristine from Slang**, `-O3` | `slang/` base | 91 KB | 48 KB | arm64 |
+| **this build**, `-O3` | `slang/SlabStamping.st` | 124 KB | 80 KB | arm64 |
 
 Notes:
 - The shipped stock binary and the pristine-from-Slang build are **different binaries**
@@ -131,13 +131,15 @@ Notes:
   That is what validates *pristine-from-Slang* as the correct stock baseline — the
   benchmark and pixel-diff numbers compare like against like (same compiler, same flags),
   not against Cuis's mystery bundle.
-- The shipped bundle's `__TEXT` is *smaller* (49 KB vs our 64 KB) — it is built
-  size-optimized (`-Os`-like), and it benchmarks **~8% slower** than the same source at
-  `-O2` (832 vs 770 ms; see [`../benchmark/`](../benchmark/README.md)). So `-O2` from
-  Slang already edges out what ships before any algorithm change — the pristine baseline
-  is honest, not a straw man.
-- This build and pristine have identical `__TEXT` (64 KB) only because 64 KB is a segment
-  alignment boundary both round up to; the actual machine code differs (see LoC below).
+- The shipped bundle's `__TEXT` is *smaller* (49 KB) — it is built size-optimized
+  (`-Os`-like), and it benchmarks **~13% slower** than the same source at `-O3` (829 vs
+  734 ms; see [`../benchmark/`](../benchmark/README.md)). So recompiling from Slang already
+  edges out what ships before any algorithm change — the pristine baseline is honest, not a
+  straw man.
+- This build's `__TEXT` (80 KB) is larger than pristine's (48 KB): the added slab/coverage
+  methods are more code, and `-O3` inlines the hot per-pixel loops aggressively. `-O3` is
+  bit-identical to `-O2` here (verified same-checksum render) and ~9% faster; see the main
+  [README](../README.md#a-note-on-the-optimization-level).
 
 ## Lines of code
 

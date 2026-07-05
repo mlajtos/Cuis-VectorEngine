@@ -1,7 +1,7 @@
 "VectorEngine benchmark suite.
-Renders a set of workloads offscreen through VectorCanvas and reports the best-of-3
-milliseconds for each, plus a total. Every workload is deterministic, so the number is
-comparable across plugin builds.
+Renders a set of workloads offscreen through VectorCanvas and reports, for each workload,
+the mean / standard deviation / coefficient of variation over 20 timed samples (plus a
+total). Every workload is deterministic, so the numbers are comparable across plugin builds.
 
 Run it from a Workspace (select all, 'print it') -- it answers a report String.
 Headless / over a bridge, run it inside the UI process (the VectorEnginePlugin is not
@@ -21,23 +21,26 @@ Workloads:
   textPlain   a paragraph drawn many times (glyph rasterization / tile cache)
   textDense   small text, many short runs (layout + rasterization pressure)
 "
-| form canvas bench report font para total run |
+| form canvas bench report font para totMean totVar run fmt |
 form := Form extent: 900@700 depth: 32.
 canvas := VectorCanvas onForm: form.
 font := FontFamily defaultFamilyAndPointSize.
 para := 'The quick brown fox jumps over the lazy dog. 0123456789 !!@#$%^&*() {[<>]}'.
 report := OrderedCollection new.
 
+"Each workload: warm once, then take 20 timed samples of `reps` iterations.
+Report mean, standard deviation (sigma = sqrt variance), and coefficient of variation."
 bench := [:name :reps :block |
-	| t best |
+	| t times mean var |
 	block value.                              "warm (bakes glyph tiles, warms caches)"
-	best := 1000000.
-	3 timesRepeat: [
+	times := OrderedCollection new.
+	20 timesRepeat: [
 		t := Time localMillisecondClock.
 		reps timesRepeat: block.
-		t := Time localMillisecondClock - t.
-		best := best min: t].
-	report add: { name. best } ].
+		times add: (Time localMillisecondClock - t)].
+	mean := (times inject: 0 into: [:a :b | a + b]) / times size.
+	var := (times inject: 0 into: [:a :b | a + ((b - mean) * (b - mean))]) / times size.
+	report add: { name. mean asFloat. var asFloat } ].
 
 "--- strokes ---"
 bench value: 'hairlines' value: 12 value: [
@@ -105,14 +108,21 @@ bench value: 'textDense' value: 8 value: [
 			canvas drawString: 'item ', (row * 4 + col) printString, ' -- lorem ipsum'
 				at: (col * 220 + 8) @ (row * 30 + 14) font: font color: (Color gray: 0.15)]]].
 
-total := (report inject: 0 into: [:acc :each | acc + (each at: 2)]).
+"one decimal place, no Float print noise"
+fmt := [:x | | n | n := (x * 10) rounded. (n // 10) printString, '.', (n \\ 10) printString].
+totMean := report inject: 0 into: [:acc :each | acc + (each at: 2)].
+totVar := report inject: 0 into: [:acc :each | acc + (each at: 3)].   "variances add for independent workloads"
 run := String streamContents: [:s |
-	s nextPutAll: 'VectorEngine benchmark (best-of-3 ms, lower is better)'; newLine.
-	s nextPutAll: '------------------------------------------------------'; newLine.
-	report do: [:each | | pad |
-		pad := (14 - (each at: 1) size) max: 1.
-		s nextPutAll: (each at: 1); nextPutAll: (String new: pad withAll: Character space).
-		s nextPutAll: (each at: 2) printString; nextPutAll: ' ms'; newLine].
-	s nextPutAll: '------------------------------------------------------'; newLine.
-	s nextPutAll: ('TOTAL', (String new: 9 withAll: Character space)), total printString, ' ms'].
+	s nextPutAll: 'VectorEngine benchmark (20 runs; mean ms, sigma = stddev, CV = sigma/mean)'; newLine.
+	s nextPutAll: '--------------------------------------------------------------------------'; newLine.
+	report do: [:each | | name mean var sd pad |
+		name := each at: 1. mean := each at: 2. var := each at: 3. sd := var sqrt.
+		pad := (14 - name size) max: 1.
+		s nextPutAll: name; nextPutAll: (String new: pad withAll: Character space).
+		s nextPutAll: (fmt value: mean); nextPutAll: ' ms   sigma '; nextPutAll: (fmt value: sd).
+		s nextPutAll: '   CV '; nextPutAll: (fmt value: (mean = 0 ifTrue: [0] ifFalse: [sd / mean * 100])); nextPutAll: '%'; newLine].
+	s nextPutAll: '--------------------------------------------------------------------------'; newLine.
+	s nextPutAll: 'TOTAL'; nextPutAll: (String new: 9 withAll: Character space).
+	s nextPutAll: (fmt value: totMean); nextPutAll: ' ms   sigma '; nextPutAll: (fmt value: totVar sqrt).
+	s nextPutAll: '   CV '; nextPutAll: (fmt value: (totMean = 0 ifTrue: [0] ifFalse: [totVar sqrt / totMean * 100])); nextPutAll: '%'].
 run

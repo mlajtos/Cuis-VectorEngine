@@ -25,26 +25,26 @@ C), exactly like the upstream plugin — `slang/SlabStamping.st` is the source o
 
 ## What you get
 
-The [`benchmark/`](benchmark/) suite — strokes, beziers, fills, text — best-of-3 ms on an
-idle M1, all three builds measured back-to-back with **only the bench bridge loaded** (no
-application packages — a package that patches a hot rasterizer method skews the baseline;
-see the benchmark README). **shipped stock** is the bundle Cuis actually ships (no source);
-**pristine** is the same base plugin recompiled from Slang at `-O2` (isolates algorithm
-from compiler); **this build** is the augmented plugin + `VectorEngineOpt`:
+The [`benchmark/`](benchmark/) suite — strokes, beziers, fills, text — mean of 20 runs
+(±σ) on an idle M1, all three builds measured back-to-back with **only the bench bridge
+loaded** (no application packages — a package that patches a hot rasterizer method skews
+the baseline; see the benchmark README). **shipped stock** is the bundle Cuis actually
+ships (no source); **pristine** is the same base plugin recompiled from Slang at `-O3`
+(isolates algorithm from compiler); **this build** is the augmented plugin + `VectorEngineOpt`:
 
-| | shipped stock | pristine (Slang -O2) | this build | vs stock |
+| | shipped stock | pristine (Slang -O3) | this build | vs stock |
 |---|--:|--:|--:|--:|
-| strokes (hairlines) | 540 ms | 509 ms | 207 ms | **2.6×** |
-| fills | 28–44 ms | 23–35 ms | 16–22 ms | ~1.9× |
-| **text** | 52–60 ms | 49–57 ms | 5–9 ms | **7–10×** |
-| **whole suite** | **832 ms** | **770 ms** | **340 ms** | **2.4×** |
+| strokes (hairlines) | 541 ms | 481 ms | 190 ms | **2.9×** |
+| fills | 27–43 ms | 23–34 ms | 14–19 ms | ~2× |
+| **text** | 51–60 ms | 46–56 ms | 5–8 ms | **7–11×** |
+| **whole suite** | **829 ms** | **734 ms** | **314 ms** | **2.6×** |
 
 The gain is algorithmic (see [techniques](#what-makes-it-faster)), **not** a compiler
-flag. Note the shipped bundle is actually ~8% *slower* than pristine-from-Slang at `-O2`
-(it's built size-optimized), so `-O2` already edges it out before any algorithm change —
-this build is **2.4× over what ships**, 2.3× over the same-flags baseline. The outsized
-text win is the `VectorEngineOpt` glyph-tile cache. Full per-workload table and
-methodology in [`benchmark/README.md`](benchmark/README.md).
+flag. Note the shipped bundle is actually ~13% *slower* than pristine-from-Slang at `-O3`
+(it's built size-optimized), so recompiling alone already edges it out before any algorithm
+change — this build is **2.6× over what ships**, 2.3× over the same-flags baseline. The
+outsized text win is the `VectorEngineOpt` glyph-tile cache. Full per-workload table,
+standard deviations, and methodology in [`benchmark/README.md`](benchmark/README.md).
 
 ---
 
@@ -80,13 +80,13 @@ git clone --depth 1 --branch Cog \
 
 # compile the committed C into a bundle
 ./build.sh
-# -> ./VectorEnginePlugin   (arm64, -O2)
+# -> ./VectorEnginePlugin   (arm64, -O3)
 ```
 
 `build.sh` runs:
 
 ```sh
-clang -arch arm64 -O2 -g -bundle -undefined dynamic_lookup \
+clang -arch arm64 -O3 -g -bundle -undefined dynamic_lookup \
   -DHAVE_CONFIG_H=1 -DNDEBUG=1 -DDEBUGVM=0 -DBUILD_FOR_OSX=1 \
   -I osvm/platforms/iOS/vm/OSX -I osvm/platforms/Cross/vm -I osvm/src/spur64.cog \
   -o VectorEnginePlugin generated/VectorEnginePlugin.c
@@ -94,15 +94,16 @@ clang -arch arm64 -O2 -g -bundle -undefined dynamic_lookup \
 
 On Intel: `ARCH=x86_64 ./build.sh`. Different headers checkout: `OSVM=/path ./build.sh`.
 
-### A note on `-O2`
+### A note on the optimization level
 
 Cuis ships this plugin as an **external bundle compiled size-optimized** (`-Os`-like — its
-`__TEXT` is *smaller* than an `-O2` build, and it benchmarks ~8% slower than the same
-source compiled at `-O2`). So `-O2` is not a trick to beat stock; it is simply the right
-level: it matches or slightly edges the shipped bundle before any algorithm change, and
-lets the algorithmic wins land. **Do not build at `-O0`** — the rasterizer is a tight
-per-pixel loop and an `-O0` build is markedly *slower* than the shipped plugin, erasing
-the algorithmic gains. `build.sh` uses `-O2`; keep it there.
+`__TEXT` is *smaller* than an `-O2` build, and it benchmarks ~13% slower than the same
+source at `-O3`). `build.sh` uses **`-O3`**, chosen empirically: over `-O2` it is a further
+~9% and is **bit-identical** (conforming optimization never reassociates floats — verified
+same-checksum output). **Do not** use `-ffast-math` (it relaxes IEEE, breaking the
+opaque-fast-path identity the correctness proof depends on) or `-O0` (markedly *slower*
+than even the shipped bundle). `-flto`/`-march=native` add nothing here (single
+translation unit). Keep `-O3`.
 
 ## Using it
 
@@ -125,7 +126,7 @@ pixel-for-pixel identical — no image changes required.
 
 - a **glyph-tile cache** and a **fused text path** — each `(font, size, glyph,
   sub-pixel phase)` rasterizes once, then whole runs composite as cached coverage tiles.
-  ~7–10× on text drawing. These call prims this build adds (`primStampCoverageRunWP`,
+  ~7–11× on text drawing. These call prims this build adds (`primStampCoverageRunWP`,
   `primBlendStampedCoverageRunWP`, `primClearMaskWP`, `primExtractCoverageWP`), so they
   need **this** plugin, not the stock one.
 - a **fast `opaqueImage:at:`** — a rule-3 morph-ids clear (11× faster than the rule-0
@@ -148,7 +149,7 @@ segment in one pass** (`slabStampSegmentWP…`) — per-scanline x-interval, ana
 point-to-segment distance, round caps falling out of the endpoint branches. Same
 distance→alpha curve, but evaluated *exactly* per pixel rather than accumulated from
 overlapping hops — so edge coverage is slightly different (and marginally smoother) than
-stock, at a fraction of the work. This carries the ~2.4× on stroke-heavy scenes.
+stock, at a fraction of the work. This carries the ~2.9× on stroke-heavy scenes.
 
 **Fills — bulk interior runs.**
 A shape's interior is long runs of fully-covered pixels between anti-aliased edges. The
@@ -189,7 +190,7 @@ window, anti-aliased clip columns, span updates) the two-pass path would. Kerned
 whose *ink* overlaps fall back to the mask path (which max-combines them), so a run is
 partitioned. The fused compositing is bit-identical to the two-pass path; the *cache* it
 draws from is what makes cached text visually-equivalent-not-identical to stock (next
-item). With the tile cache this is ~7–10× on text.
+item). With the tile cache this is ~7–11× on text.
 
 **Glyph-tile cache** (`VectorEngineOpt`, image side).
 `GlyphTileCache` bakes each `(font, effective size, glyph, sub-pixel phase)` once through
@@ -214,7 +215,7 @@ fast path and runs **~11× slower** than the identical store (5.8 ms vs 0.5 ms p
 slang/SlabStamping.st    Slang source of truth (translates to the plugin C)
 generated/VectorEnginePlugin.c   committed translation of slang/SlabStamping.st
 VectorEngineOpt.pck.st   image-side package (glyph-tile cache, fused text, ids-clear)
-build.sh                 compile the generated C -> loadable -O2 bundle
+build.sh                 compile the generated C -> loadable -O3 bundle
 regenerate/              scripts + notes to re-run the Slang->C translation
 check_alpha_identity.c   brute-force proof behind the opaque-target fast path
 ```
@@ -240,6 +241,17 @@ Two classes of change, held to two different standards:
 
 ## Provenance & license
 
-Derived from Cuis's `VectorEnginePlugin-jmv.26` (by Juan Vuletich) and translated with
-`VMMaker.oscog-eem.3767`. MIT-licensed (see `LICENSE`); the upstream VectorEnginePlugin
-and the OpenSmalltalk VM carry their own licenses.
+Derived from the base **`VectorEnginePlugin-jmv.26`** (by Juan Vuletich), obtained from its
+SqueakSource project:
+
+- Plugin source: **http://www.squeaksource.com/VectorEnginePlugin** (package
+  `VectorEnginePlugin-jmv.26`)
+- Translated to C with `VMMaker.oscog-eem.3767` (VMMaker from
+  http://source.squeak.org/VMMaker)
+
+Developed and benchmarked against the **OpenSmalltalk Cog/Spur VM `7.20260609.1739`**
+(`VMMaker.oscog-eem.3764`) running **Cuis 7.9 (image update 7983)** on macOS/arm64. The
+generated C is ABI-compatible with any current Cog/Spur VM, not just this build.
+
+MIT-licensed (see `LICENSE`); the upstream VectorEnginePlugin and the OpenSmalltalk VM
+carry their own licenses.
