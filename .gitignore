@@ -1,0 +1,13 @@
+.DS_Store
+# OpenSmalltalk headers checkout (compile-time only; clone locally)
+osvm/
+# regeneration scratch
+regenerate/gen/
+regenerate/*.txt
+*.image
+*.changes
+# built plugin bundles + debug symbols
+VectorEnginePlugin
+*.bundle
+*.dSYM/
+a.out
