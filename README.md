@@ -4,10 +4,20 @@ A faster drop-in build of Cuis Smalltalk's **VectorEnginePlugin** (the whole-pix
 anti-aliased vector rasterizer behind `VectorCanvas`), plus a small image-side package
 (`VectorEngineOpt`) that adds a glyph-tile cache and a few rendering fast paths.
 
-Every change here is **bit-identical** to the stock rasterizer's output — verified by
-render oracles (per-pixel checksums of the same scene through both builds) and, where a
-shortcut relies on a floating-point identity, by exhaustive proof (see
-`check_alpha_identity.c`). It is faster, not different.
+It is **visually equivalent** to the stock rasterizer, **not bit-identical**: solid fill
+interiors and the plugin's outline text are pixel-for-pixel identical, while anti-aliased
+*edges* differ slightly — the stroke/curve rasterizer computes exact analytic per-pixel
+distance where stock hop-samples, and the optional cached-text path (`VectorEngineOpt`)
+snaps glyphs to a ⅛-pixel grid. Differences are confined to edge pixels and bounded
+(Δ41/255 worst case on primitives, ~72% ≤ Δ6/255; glyph edges up to Δ111 but same
+letterforms), imperceptible in normal use — and if anything the exact-distance stroke
+edges are marginally *smoother*. See [`validate/`](validate/) for measured per-primitive
+and text pixel-diffs, rendered A/B comparisons, and zoomed crops. The *other*
+optimizations layered on top of the rasterizer (opaque-target fast path, bulk runs,
+gang-skip, dirty-span journal) **are** provably bit-identical (render oracles; and for the
+one shortcut that leans on an IEEE identity, exhaustive proof — `check_alpha_identity.c`).
+The non-bit-identity comes from exactly two things: exact-distance slab stamping replacing
+hop-sampling, and the glyph cache's sub-pixel snapping.
 
 The plugin is generated from Slang (the restricted Smalltalk that VMMaker translates to
 C), exactly like the upstream plugin — `slang/SlabStamping.st` is the source of truth,
@@ -119,15 +129,19 @@ pixel-for-pixel identical — no image changes required.
 ## What makes it faster
 
 All techniques are in `slang/SlabStamping.st` (plugin) or `VectorEngineOpt.pck.st`
-(image side). Each is bit-identical to the stock output.
+(image side). Every one is bit-identical to stock **except slab stamping**, which is
+visually equivalent (exact-distance vs hop-sampled anti-aliased edges — see
+[`validate/`](validate/)).
 
 **Strokes — slab stamping.**
 The stock stroke rasterizer walks a pen along the segment and stamps a distance-disk at
 every hop, so each pixel is visited ~`penWidth·2/hop` times. Instead, for a whole
 transformed segment, compute the **exact distance from each affected pixel to the
 segment in one pass** (`slabStampSegmentWP…`) — per-scanline x-interval, analytic
-point-to-segment distance, round caps falling out of the endpoint branches. Same alpha
-function, a fraction of the work. This carries the ~2.4× on stroke-heavy scenes.
+point-to-segment distance, round caps falling out of the endpoint branches. Same
+distance→alpha curve, but evaluated *exactly* per pixel rather than accumulated from
+overlapping hops — so edge coverage is slightly different (and marginally smoother) than
+stock, at a fraction of the work. This carries the ~2.4× on stroke-heavy scenes.
 
 **Fills — bulk interior runs.**
 A shape's interior is long runs of fully-covered pixels between anti-aliased edges. The
@@ -166,13 +180,19 @@ blended — three memory passes. The fused path (`blendStampedCoverageRunWP…`)
 the tiles **directly** with the fill color, applying the exact per-pixel treatment (clip
 window, anti-aliased clip columns, span updates) the two-pass path would. Kerned glyphs
 whose *ink* overlaps fall back to the mask path (which max-combines them), so a run is
-partitioned and the result stays bit-identical. With the tile cache this is ~9–11× on text.
+partitioned. The fused compositing is bit-identical to the two-pass path; the *cache* it
+draws from is what makes cached text visually-equivalent-not-identical to stock (next
+item). With the tile cache this is ~9–11× on text.
 
 **Glyph-tile cache** (`VectorEngineOpt`, image side).
 `GlyphTileCache` bakes each `(font, effective size, glyph, sub-pixel phase)` once through
 the normal outline pipeline and extracts its coverage; runs then composite cached tiles.
-Scale-free (tiles bake on demand at the drawn size), so they inherit the rasterizer's
-exact anti-aliasing.
+Scale-free (tiles bake on demand at the drawn size), so each phase inherits the
+rasterizer's exact anti-aliasing. The cache keeps **8 phases per glyph** — quarter-pixel
+horizontal, half-pixel vertical — and snaps each placement to the nearest, so a glyph
+rasterizes at most 8 times however often it appears. That ≤⅛px snap makes cached text
+*visually equivalent but not bit-identical* to stock's exact continuous placement — see
+[`validate/`](validate/#text) for the measured text diff and A/B renders.
 
 **Faster morph-ids clear** (`VectorEngineOpt`, image side).
 Clearing the morph-ids buffer used BitBlt `combinationRule: 0`, which falls off BitBlt's
@@ -194,12 +214,22 @@ check_alpha_identity.c   brute-force proof behind the opaque-target fast path
 
 ## Correctness
 
-The rule for the whole project: **an optimization must produce bit-identical output, or
-it does not ship.** Validation used offscreen `VectorCanvas` renders and live window
-captures checksummed pixel-for-pixel against the stock build, plus the exhaustive float
-proof for the one shortcut that leans on an IEEE identity. When a change traded
-correctness for speed (an early "consume the dirty journal in the blend" variant), a
-deterministic window-flight replay caught it and it was fixed, not shipped.
+Two classes of change, held to two different standards:
+
+1. **The arithmetic optimizations** (opaque-target fast path, bulk interior runs,
+   gang-skip, vectorizable stores, dirty-span journal) must be **bit-identical**, or they
+   do not ship. They were validated with offscreen `VectorCanvas` renders and live window
+   captures checksummed pixel-for-pixel against the stock build, plus an exhaustive float
+   proof for the one shortcut that leans on an IEEE identity (`check_alpha_identity.c`).
+   When an early "consume the dirty journal in the blend" variant traded correctness for
+   speed, a deterministic window-flight replay caught it and it was fixed, not shipped.
+
+2. **Slab stamping** (the exact-distance stroke/curve rasterizer) is **visually
+   equivalent but not bit-identical** — it computes analytic per-pixel distance where
+   stock hop-samples, so anti-aliased *edges* differ by a small, bounded amount. Interiors
+   and plugin outline text stay identical. The full measured per-primitive pixel-diff,
+   rendered A/B images, zoomed crops, and a three-way binary comparison (including Cuis's
+   shipped no-source bundle) are in [`validate/`](validate/).
 
 ## Provenance & license
 
