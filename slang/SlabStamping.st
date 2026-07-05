@@ -1,17 +1,18 @@
-'Slab stamping v8 for VectorEnginePlugin (whole pixel family). Applies on top of v7.
-DIRTY-SPAN JOURNAL, bit-identical output: two plugin-internal per-row arrays
-(dirtyLeftJ, dirtyRightJ, allocated at set-target) record the x-extent every WP
-stamper touches on each row. The WP blend passes then clamp their per-row sweep to
-the dirty span and reset it, instead of scanning the whole span bounding box:
-- pixels outside the dirty span hold no stamps, so stroke alpha is zero there and
-  fill winding cannot change there (edges ARE stamps, and a closed path''s crossings
-  balance to zero after the rightmost one), so skipping them is bit-identical;
-- the journal is an over-approximation (stampers record the examined, clip-clamped
-  range; conditional writes may not all land): a dirty row with clean bytes is swept
-  cheaply by the existing segment machinery, never incorrectly;
-- a window-chrome stroke blend used to sweep its whole 4.2 Mpx bounding box for a
-  ring that touches ~2% of it; now each row costs two loads outside the ring rows.
-ML 7/4/2026'!
+'Slab stamping optimizations for VectorEnginePlugin (whole pixel family).
+Consolidated Slang source: applies on top of the base VectorEnginePlugin-jmv.26 and
+carries every whole-pixel raster optimization in this project, each bit-identical to
+the stock output (verified by render oracles; the opaque-target fast path additionally
+by exhaustive float proof -- see check_alpha_identity.c):
+ - slab stamping: analytic per-pixel segment distance in one pass (strokes/beziers);
+ - bulk interior fill runs (opaque overwrite / hoisted-constant blend);
+ - opaque-target fast path in the At-helpers (skips 3 divides + 3 mults per AA pixel);
+ - u64 gang-skip of clear segments; vectorizable split target/id stores;
+ - bulk runs extended across clear segments;
+ - dirty-span journal (per-row stamped extent bounds the blend sweep);
+ - fused stamp+blend for glyph coverage runs (no alpha-mask round trip);
+ - clearMaskWP prim for clip-independent glyph-tile baking.
+Translate to C with VMMaker (see regenerate/); the committed generated/VectorEnginePlugin.c
+is this file''s output. ML 2026'!
 
 SmartSyntaxInterpreterPlugin subclass: #VectorEnginePlugin
 	instanceVariableNames: 'targetBits morphIds edgeCounts edgeCountsWP alphaMask alphaMaskWP affectedBits contour targetWidth targetHeight targetAssumedOpaque antiAliasingWidth subPixelDelta hop strokeWidth strokeR strokeG strokeB strokeA dashedStrokeBits dashBitCount dashBitLength dashBitOffset fillR fillG fillB fillA txA11 txA12 txA13 txA21 txA22 txA23 currentMorphId clipLeft clipTop clipRight clipBottom clippingSpec auxAntiAliasingWidthScaledInverse auxStrokeWidthDilatedHalf auxStrokeWidthDilatedHalfSquared auxStrokeWidthErodedHalfSquared spanLeft spanTop spanRight spanBottom prevYTruncated prevYRounded leftAtThisY rightAtThisY trajectoryLength needsFullAlphaCircle dirtyLeftJ dirtyRightJ dirtyRowsAllocated dirtyMinY dirtyMaxY'
@@ -19,34 +20,626 @@ SmartSyntaxInterpreterPlugin subclass: #VectorEnginePlugin
 	poolDictionaries: ''
 	category: 'VectorEnginePlugin'!
 
-!VectorEnginePlugin class methodsFor: 'translation' stamp: 'ML 7/4/2026 20:00'!
-declareCVarsIn: aCCodeGenerator
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 2026'!
+pvt_lineWPFromX: xFrom y: yFrom toX: xTo y: yTo
 
+	<var: 'xFrom' type: #float>
+	<var: 'yFrom' type: #float>
+	<var: 'xTo' type: #float>
+	<var: 'yTo' type: #float>
+	| txFrom tyFrom txTo tyTo dx dy hops t oneLessT increment x y runStartK kEnd bit isOn tR0 tR1 |
+	<var: 'txFrom' type: #float>
+	<var: 'tyFrom' type: #float>
+	<var: 'txTo' type: #float>
+	<var: 'tyTo' type: #float>
+	<var: 'dx' type: #float>
+	<var: 'dy' type: #float>
+	<var: 'hops' type: #int>
+	<var: 't' type: #float>
+	<var: 'oneLessT' type: #float>
+	<var: 'increment' type: #float>
+	<var: 'x' type: #float>
+	<var: 'y' type: #float>
+	<var: 'runStartK' type: #int>
+	<var: 'kEnd' type: #int>
+	<var: 'tR0' type: #float>
+	<var: 'tR1' type: #float>
 
-	aCCodeGenerator addHeaderFile: '<stdint.h>'.
-	aCCodeGenerator addHeaderFile: '<stdlib.h>'.
-	aCCodeGenerator var: 'targetBits' type: 'uint32_t *'.
-	aCCodeGenerator var: 'morphIds' type: 'uint32_t *'.
-	aCCodeGenerator var: 'edgeCounts' type: 'uint32_t *'.
-	aCCodeGenerator var: 'edgeCountsWP' type: 'uint8_t *'.
-	aCCodeGenerator var: 'alphaMask' type: 'uint32_t *'.
-	aCCodeGenerator var: 'alphaMaskWP' type: 'uint8_t *'.
-	aCCodeGenerator var: 'affectedBits' type: 'uint8_t *'.
-	aCCodeGenerator var: 'contour' type: 'float *'.
-	aCCodeGenerator var: 'currentMorphId' type: 'uint32_t'.
-	aCCodeGenerator var: 'clippingSpec' type: 'int *'.
-	"Dirty-span journal: per-row stamped x-extent, plugin-internal (see class comment
-	of the v8 change set). Static NULL/0 initialization is correct: the set-target
-	primitive allocates and initializes before any stamper can run."
-	aCCodeGenerator var: 'dirtyLeftJ' type: 'int *'.
-	aCCodeGenerator var: 'dirtyRightJ' type: 'int *'.
-	aCCodeGenerator var: 'dirtyRowsAllocated' type: 'int'.
-	aCCodeGenerator var: 'dirtyMinY' type: 'int'.
-	aCCodeGenerator var: 'dirtyMaxY' type: 'int'.
-	#(antiAliasingWidth subPixelDelta hop strokeWidth strokeR strokeG strokeB strokeA dashBitLength fillR fillG fillB fillA txA11 txA12 txA13 txA21 txA22 txA23 auxAntiAliasingWidthScaledInverse auxStrokeWidthDilatedHalf auxStrokeWidthDilatedHalfSquared auxStrokeWidthErodedHalfSquared spanLeft spanTop spanRight spanBottom leftAtThisY rightAtThisY trajectoryLength) do: [ :varName |
-		aCCodeGenerator var: varName type: 'float' ].! !
+	trajectoryLength := 0.0.
+	needsFullAlphaCircle := true.
+	txFrom := (xFrom * txA11) + (yFrom * txA12) + txA13.
+	tyFrom := (xFrom * txA21) + (yFrom * txA22) + txA23.
+	txTo := (xTo * txA11) + (yTo * txA12) + txA13.
+	tyTo := (xTo * txA21) + (yTo * txA22) + txA23.
+	dx := txTo-txFrom.
+	dy := tyTo-tyFrom.
+	dx := dx abs.
+	dy := dy abs.
+	hops := ((dx max: dy) / hop) asInteger + 1.
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - setup' stamp: 'ML 7/4/2026 20:00'!
+	spanLeft := spanLeft min: (txFrom min: txTo).
+	spanRight := spanRight max: (txFrom max: txTo).
+	spanTop := spanTop min: (tyFrom min: tyTo).
+	spanBottom := spanBottom max: (tyFrom max: tyTo).
+
+	t := 0.0.
+	increment := 1.0 / hops.
+	dashBitLength = 0.0
+		ifTrue: [
+			"Solid stroke: one slab pass stamps the whole segment, each pixel visited once."
+			self slabStampSegmentWPFromX: txFrom y: tyFrom toX: txTo y: tyTo ]
+		ifFalse: [
+			"Dashed: classify each sample on/off with the SAME trajectoryLength accumulator
+			the disk stamper uses, then stamp each run of consecutive 'on' samples as one
+			slab sub-segment. Round caps at dash ends fall out of the distance math."
+			runStartK := -1.
+			1 to: hops + 1 do: [ :k |
+				trajectoryLength := trajectoryLength + hop.
+				"Note: dashBitOffset must be positive."
+				bit := ((trajectoryLength / dashBitLength) asInteger + dashBitOffset) \\ dashBitCount.
+				isOn := (dashedStrokeBits bitAnd: 1 << (dashBitCount-bit-1)) ~= 0.
+				(isOn and: [runStartK < 0]) ifTrue: [ runStartK := k ].
+				(runStartK >= 0 and: [isOn not or: [k = (hops + 1)]]) ifTrue: [
+					kEnd := isOn ifTrue: [k] ifFalse: [k - 1].
+					tR0 := (runStartK - 1) * increment.
+					tR0 > 1.0 ifTrue: [ tR0 := 1.0 ].
+					tR1 := (kEnd - 1) * increment.
+					tR1 > 1.0 ifTrue: [ tR1 := 1.0 ].
+					self
+						slabStampSegmentWPFromX: ((1.0-tR0) * txFrom) + (tR0 * txTo)
+						y: ((1.0-tR0) * tyFrom) + (tR0 * tyTo)
+						toX: ((1.0-tR1) * txFrom) + (tR1 * txTo)
+						y: ((1.0-tR1) * tyFrom) + (tR1 * tyTo).
+					runStartK := -1 ]]].
+
+	"Edge counts and contour keep the original sampled walk (identical output to the
+	sampled stamper; correct fill edge counts require visiting every y at least once)."
+	[ t < 1.0 ] whileTrue: [
+		oneLessT := 1.0 - t.
+		x := (oneLessT * txFrom) + (t * txTo).
+		y := (oneLessT * tyFrom) + (t * tyTo).
+		fillA = 0.0 ifFalse: [
+			self updateEdgeCountWPAtX: x y: y ].
+		self updateContourForX: x y: y.
+		t := t + increment. ].
+	fillA = 0.0 ifFalse: [
+		self updateEdgeCountWPAtX: txTo y: tyTo ].
+	self updateContourForX: txTo y: tyTo.! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 2026'!
+pvt_quadraticBezierWPFromX: xFrom y: yFrom toX: xTo y: yTo controlX: xControl y: yControl
+
+	<var: 'xFrom' type: #float>
+	<var: 'yFrom' type: #float>
+	<var: 'xTo' type: #float>
+	<var: 'yTo' type: #float>
+	<var: 'xControl' type: #float>
+	<var: 'yControl' type: #float>
+	| txFrom tyFrom txTo tyTo txControl tyControl dx dy dx2 dy2 length xMinEnd xMaxEnd yMinEnd yMaxEnd t0 x0 y0 t oneLessT increment f1 f2 f3 x y correction chordX chordY cdx cdy |
+	<var: 'chordX' type: #float>
+	<var: 'chordY' type: #float>
+	<var: 'cdx' type: #float>
+	<var: 'cdy' type: #float>
+	<var: 'txFrom' type: #float>
+	<var: 'tyFrom' type: #float>
+	<var: 'txTo' type: #float>
+	<var: 'tyTo' type: #float>
+	<var: 'txControl' type: #float>
+	<var: 'tyControl' type: #float>
+	<var: 'dx' type: #float>
+	<var: 'dy' type: #float>
+	<var: 'dx2' type: #float>
+	<var: 'dy2' type: #float>
+	<var: 'length' type: #float>
+	<var: 'correction' type: #float>
+	<var: 't0' type: #float>
+	<var: 'x0' type: #float>
+	<var: 'y0' type: #float>
+	<var: 't' type: #float>
+	<var: 'oneLessT' type: #float>
+	<var: 'increment' type: #float>
+	<var: 'f1' type: #float>
+	<var: 'f2' type: #float>
+	<var: 'f3' type: #float>
+	<var: 'x' type: #float>
+	<var: 'y' type: #float>
+	<var: 'xMinEnd' type: #float>
+	<var: 'xMaxEnd' type: #float>
+	<var: 'yMinEnd' type: #float>
+	<var: 'yMaxEnd' type: #float>
+	
+
+	"If control point is bogus, just draw a line"
+	(xControl = xTo and: [ yControl = yTo ]) ifTrue: [
+		^self pvt_lineWPFromX: xFrom y: yFrom toX: xTo y: yTo ].
+	(xControl = xFrom and: [ yControl = yFrom ]) ifTrue: [
+		^self pvt_lineWPFromX: xFrom y: yFrom toX: xTo y: yTo ].
+
+	trajectoryLength := 0.0.
+	needsFullAlphaCircle := true.
+	txFrom := (xFrom * txA11) + (yFrom * txA12) + txA13.
+	tyFrom := (xFrom * txA21) + (yFrom * txA22) + txA23.
+	txTo := (xTo * txA11) + (yTo * txA12) + txA13.
+	tyTo := (xTo * txA21) + (yTo * txA22) + txA23.
+	txControl := (xControl * txA11) + (yControl * txA12) + txA13.
+	tyControl := (xControl * txA21) + (yControl * txA22) + txA23.
+	dx := (txTo-txFrom) abs.
+	dx2 := (txControl-txFrom) abs.
+	dy := (tyTo-tyFrom) abs.
+	dy2 := (tyControl-tyFrom) abs.
+
+	"If almost a vertical line, just draw a line. (Ignoring control point)"
+	(dx < 1.0 and: [dx2 < 1.0]) ifTrue: [
+		^self pvt_lineWPFromX: xFrom y: yFrom toX: xTo y: yTo ].
+
+	"If almost an horizontal line, just draw a line. (Ignoring control point)"
+	(dy < 1.0 and: [dy2 < 1.0]) ifTrue: [
+		^self pvt_lineWPFromX: xFrom y: yFrom toX: xTo y: yTo ].
+
+	"This computed span of the Bezier curve is a bit pessimistic (larger than strict bounds), but safe."
+	xMinEnd := txFrom min: txTo.
+	xMaxEnd := txFrom max: txTo.
+	yMinEnd := tyFrom min: tyTo.
+	yMaxEnd := tyFrom max: tyTo.
+	spanLeft := spanLeft min: (xMinEnd min: (xMinEnd+txControl) / 2.0).
+	spanRight := spanRight max: (xMaxEnd max: (xMaxEnd+txControl) / 2.0).
+	spanTop := spanTop min: (yMinEnd min: (yMinEnd+tyControl) / 2.0).
+	spanBottom := spanBottom max: (yMaxEnd max: (yMaxEnd+tyControl) / 2.0).
+
+	"Case t = 0.0"
+	x := txFrom.
+	y := tyFrom.
+	dashBitLength = 0.0
+		ifTrue: [ chordX := x. chordY := y ]
+		ifFalse: [ self updateAlphasWPForX: x y: y ].
+	fillA = 0.0 ifFalse: [
+		self updateEdgeCountWPAtX: x y: y ].
+	self updateContourForX: x y: y.
+
+	"Will be corrected for each hop. This, being close to pointFrom, is a good initial guess for first correction."
+	increment := 0.5 / (dx max: dy) min: 0.5.
+	t := 0.0.
+	[
+		t0 := t. x0 := x. y0 := y.
+		"Compute next point"
+		t := t0 + increment. oneLessT := 1.0 - t.
+		f1 := oneLessT * oneLessT. f2 := 2.0 * oneLessT * t. f3 := t * t.
+		x := (f1 * txFrom) + (f2 * txControl) + (f3 * txTo).
+		y := (f1 * tyFrom) + (f2 * tyControl) + (f3 * tyTo).
+		"Now adjust the increment to aim at the required hop length, and recompute next point."
+		dx := x-x0. dy := y-y0.
+		length := ((dx*dx) + (dy*dy)) sqrt.
+		correction := hop / (length max: 0.1). "Don't grow increment too much in one step. More importantly, don't divide by zero under any circumstances."
+		[
+			increment := increment * correction.
+			t := t0 + increment. oneLessT := 1.0 - t.
+			f1 := oneLessT * oneLessT. f2 := 2.0 * oneLessT * t. f3 := t * t.
+			x := (f1 * txFrom) + (f2 * txControl) + (f3 * txTo).
+			y := (f1 * tyFrom) + (f2 * tyControl) + (f3 * tyTo).
+			dx := x-x0. dy := y-y0.
+			length := ((dx*dx) + (dy*dy)) sqrt.
+			correction := hop / (length max: 0.1). "Don't grow increment too much in one step. More importantly, don't divide by zero under any circumstances."
+			correction < 0.99]  whileTrue.		   "Keep adjusting if actual hop would be too big"
+		t < 1.0 ]
+	whileTrue: [
+		dashBitLength = 0.0
+			ifTrue: [
+				"Chord accumulation: stamp the pen trace as ~2px straight sub-segments,
+				each pixel visited once (see slabStampSegmentWPFromX:y:toX:y:).
+				Dashed strokes keep the sampled stamper, which drives the dash pattern."
+				cdx := x - chordX. cdy := y - chordY.
+				(cdx * cdx) + (cdy * cdy) >= 4.0 ifTrue: [
+					self slabStampSegmentWPFromX: chordX y: chordY toX: x y: y.
+					chordX := x. chordY := y ]]
+			ifFalse: [ self updateAlphasWPForX: x y: y ].
+		fillA = 0.0 ifFalse: [
+			self updateEdgeCountWPAtX: x y: y ].
+		self updateContourForX: x y: y ].
+
+	"Case t= 1.0"
+	dashBitLength = 0.0
+		ifTrue: [ self slabStampSegmentWPFromX: chordX y: chordY toX: txTo y: tyTo ]
+		ifFalse: [ self updateAlphasWPForX: txTo y: tyTo ].
+	fillA = 0.0 ifFalse: [
+		self updateEdgeCountWPAtX: txTo y: tyTo ].
+	self updateContourForX: txTo y: tyTo.! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 2026'!
+pvt_cubicBezierWPFromX: xFrom y: yFrom toX: xTo y: yTo control1X: xControl1 y: yControl1 control2X: xControl2 y: yControl2
+
+	<var: 'xFrom' type: #float>
+	<var: 'yFrom' type: #float>
+	<var: 'xTo' type: #float>
+	<var: 'yTo' type: #float>
+	<var: 'xControl1' type: #float>
+	<var: 'yControl1' type: #float>
+	<var: 'xControl2' type: #float>
+	<var: 'yControl2' type: #float>
+	| txFrom tyFrom txTo tyTo txControl1 tyControl1 txControl2 tyControl2 dx dy xMinEnd xMaxEnd yMinEnd yMaxEnd t oneLessT increment f1 f23 f2 f3 f4 x y t0 x0 y0 length correction chordX chordY cdx cdy |
+	<var: 'chordX' type: #float>
+	<var: 'chordY' type: #float>
+	<var: 'cdx' type: #float>
+	<var: 'cdy' type: #float>
+	<var: 'txFrom' type: #float>
+	<var: 'tyFrom' type: #float>
+	<var: 'txTo' type: #float>
+	<var: 'tyTo' type: #float>
+	<var: 'txControl1' type: #float>
+	<var: 'tyControl1' type: #float>
+	<var: 'txControl2' type: #float>
+	<var: 'tyControl2' type: #float>
+	<var: 'dx' type: #float>
+	<var: 'dy' type: #float>
+	<var: 't' type: #float>
+	<var: 'oneLessT' type: #float>
+	<var: 'increment' type: #float>
+	<var: 'f1' type: #float>
+	<var: 'f23' type: #float>
+	<var: 'f2' type: #float>
+	<var: 'f3' type: #float>
+	<var: 'f4' type: #float>
+	<var: 'x' type: #float>
+	<var: 'y' type: #float>
+	<var: 'xMinEnd' type: #float>
+	<var: 'xMaxEnd' type: #float>
+	<var: 'yMinEnd' type: #float>
+	<var: 'yMaxEnd' type: #float>
+	<var: 'length' type: #float>
+	<var: 'correction' type: #float>
+	<var: 't0' type: #float>
+	<var: 'x0' type: #float>
+	<var: 'y0' type: #float>
+	
+	trajectoryLength := 0.0.
+	needsFullAlphaCircle := true.
+	txFrom := (xFrom * txA11) + (yFrom * txA12) + txA13.
+	tyFrom := (xFrom * txA21) + (yFrom * txA22) + txA23.
+	txTo := (xTo * txA11) + (yTo * txA12) + txA13.
+	tyTo := (xTo * txA21) + (yTo * txA22) + txA23.
+	txControl1 := (xControl1 * txA11) + (yControl1 * txA12) + txA13.
+	tyControl1 := (xControl1 * txA21) + (yControl1 * txA22) + txA23.
+	txControl2 := (xControl2 * txA11) + (yControl2 * txA12) + txA13.
+	tyControl2 := (xControl2 * txA21) + (yControl2 * txA22) + txA23.
+
+	"This computed span of the Bezier curve is a bit pessimistic (larger than strict bounds), but safe."
+	xMinEnd := txFrom min: txTo.
+	xMaxEnd := txFrom max: txTo.
+	yMinEnd := tyFrom min: tyTo.
+	yMaxEnd := tyFrom max: tyTo.
+	spanLeft := spanLeft min: (xMinEnd min: xMinEnd*0.25 + ((txControl1 min: txControl2)*0.75)).
+	spanRight := spanRight max: (xMaxEnd max: xMaxEnd*0.25 + ((txControl1 max: txControl2)*0.75)).
+	spanTop := spanTop min: (yMinEnd min: yMinEnd*0.25 + ((tyControl1 min: tyControl2)*0.75)).
+	spanBottom := spanBottom max: (yMaxEnd max: yMaxEnd*0.25 + ((tyControl1 max: tyControl2)*0.75)).
+
+	"Case t = 0.0"
+	x := txFrom.
+	y := tyFrom.
+	dashBitLength = 0.0
+		ifTrue: [ chordX := x. chordY := y ]
+		ifFalse: [ self updateAlphasWPForX: x y: y ].
+	fillA = 0.0 ifFalse: [
+		self updateEdgeCountWPAtX: x y: y ].
+	self updateContourForX: x y: y.
+
+	dx := (txTo-txFrom) abs.
+	dy := (tyTo-tyFrom) abs.
+	
+	"Will be corrected for each hop. This, being close to pointFrom, is a good initial guess for first correction."
+	increment := 0.5 / (dx max: dy) min: 0.5.
+	t := 0.0.
+	[
+		t0 := t. x0 := x. y0 := y.
+		"Compute next point"
+		t := t0 + increment. oneLessT := 1.0 - t.
+		f1 := oneLessT * oneLessT * oneLessT. f23 := 3.0 * oneLessT * t. f2 := f23 * oneLessT. f3 := f23 * t. f4 := t * t * t.
+		x := (f1 * txFrom) + (f2 * txControl1) + (f3 * txControl2) + (f4 * txTo).
+		y := (f1 * tyFrom) + (f2 * tyControl1) + (f3 * tyControl2) + (f4 * tyTo).
+		"Now adjust the increment to aim at the required hop length, and recompute next point."
+		dx := x-x0. dy := y-y0.
+		length := ((dx*dx) + (dy*dy)) sqrt.
+		correction := hop / (length max: 0.1). "Don't grow increment too much in one step. More importantly, don't divide by zero under any circumstances."
+		[
+			increment := increment * correction.
+			t := t0 + increment. oneLessT := 1.0 - t.
+			f1 := oneLessT * oneLessT * oneLessT. f23 := 3.0 * oneLessT * t. f2 := f23 * oneLessT. f3 := f23 * t. f4 := t * t * t.
+			x := (f1 * txFrom) + (f2 * txControl1) + (f3 * txControl2) + (f4 * txTo).
+			y := (f1 * tyFrom) + (f2 * tyControl1) + (f3 * tyControl2) + (f4 * tyTo).
+			dx := x-x0. dy := y-y0.
+			length := ((dx*dx) + (dy*dy)) sqrt.
+			correction := hop / (length max: 0.1). "Don't grow increment too much in one step. More importantly, don't divide by zero under any circumstances."
+			correction < 0.99]  whileTrue.		   "Keep adjusting if actual hop would be too big"
+		t < 1.0 ]
+	whileTrue: [
+		dashBitLength = 0.0
+			ifTrue: [
+				"Chord accumulation: stamp the pen trace as ~2px straight sub-segments,
+				each pixel visited once (see slabStampSegmentWPFromX:y:toX:y:).
+				Dashed strokes keep the sampled stamper, which drives the dash pattern."
+				cdx := x - chordX. cdy := y - chordY.
+				(cdx * cdx) + (cdy * cdy) >= 4.0 ifTrue: [
+					self slabStampSegmentWPFromX: chordX y: chordY toX: x y: y.
+					chordX := x. chordY := y ]]
+			ifFalse: [ self updateAlphasWPForX: x y: y ].
+		fillA = 0.0 ifFalse: [
+			self updateEdgeCountWPAtX: x y: y ].
+		self updateContourForX: x y: y ].
+
+	"Case t= 1.0"
+	dashBitLength = 0.0
+		ifTrue: [ self slabStampSegmentWPFromX: chordX y: chordY toX: txTo y: tyTo ]
+		ifFalse: [ self updateAlphasWPForX: txTo y: tyTo ].
+	fillA = 0.0 ifFalse: [
+		self updateEdgeCountWPAtX: txTo y: tyTo ].
+	self updateContourForX: txTo y: tyTo.! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - text and multi paths' stamp: 'ML 2026'!
+extractCoverageWPLeft: l top: t right: r bottom: b into: aByteArray pitch: pitch
+	"Read back the coverage (0..127) that blendFillOnlyWP would have applied for the
+	currently stamped shape into aByteArray (row major, origin at l@t, pitch bytes per
+	row), consuming and clearing the scratch buffers exactly like the blend does.
+	Used to bake glyph coverage tiles: stamp a glyph as usual, then extract its
+	coverage once and composite the cached tile from then on
+	(see blendCoverageRunWP:meta:count:)."
+
+	| pixelIndex edgesUpToThisPixel edgesThisPixel strokeAntiAliasAlphaBits outIndex cov affectedBitsIndex |
+	<var: 'edgesThisPixel' type: #'uint8_t'>
+	<var: 'edgesUpToThisPixel' type: #'uint8_t'>
+	<var: 'strokeAntiAliasAlphaBits' type: #'uint8_t'>
+	<var: 'cov' type: #'uint8_t'>
+	self
+		primitive: 'primExtractCoverageWP'
+		parameters: #(SmallInteger SmallInteger SmallInteger SmallInteger ByteArray SmallInteger).
+
+	t to: b do: [ :displayY |
+		edgesUpToThisPixel := 0.
+		pixelIndex := displayY * targetWidth + l.
+		outIndex := (displayY - t) * pitch.
+		l to: r do: [ :displayX |
+			edgesThisPixel := edgeCountsWP at: pixelIndex.
+			edgesThisPixel = 0 ifFalse: [
+				edgeCountsWP at: pixelIndex put: 0.
+				self cCode: nil inSmalltalk: [
+					edgesThisPixel > 127 ifTrue: [ edgesThisPixel := edgesThisPixel - 256 ]].
+				edgesUpToThisPixel := edgesUpToThisPixel + edgesThisPixel ].
+			strokeAntiAliasAlphaBits := alphaMaskWP at: pixelIndex.
+			strokeAntiAliasAlphaBits = 16r00 ifFalse: [ alphaMaskWP at: pixelIndex put: 0 ].
+			cov := edgesUpToThisPixel = 0
+				ifTrue: [ strokeAntiAliasAlphaBits ]
+				ifFalse: [ 16r7F - strokeAntiAliasAlphaBits ].
+			aByteArray at: outIndex put: cov.
+			outIndex := outIndex + 1.
+			pixelIndex := pixelIndex + 1 ].
+		"Clear the dirty-segment bits this row touched, like the blend would."
+		affectedBitsIndex := (displayY * targetWidth + l) >> 4.
+		[ affectedBitsIndex <= ((displayY * targetWidth + r) >> 4) ] whileTrue: [
+			affectedBits at: affectedBitsIndex put: 0.
+			affectedBitsIndex := affectedBitsIndex + 1 ]]! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - text and multi paths' stamp: 'ML 2026'!
+blendCoverageRunWP: sheet meta: metaArray count: n
+	"Composite n cached coverage tiles (glyphs) using the current fill color.
+	metaArray holds 5 words per tile: destX destY w h sheetOffset -- destination in
+	pixels (already clipped by the caller to lie fully inside the clip rect), tile
+	size, and the tile's byte offset into sheet (row major, pitch = w).
+	Assumes targetAssumedOpaque (callers fall back to the outline path otherwise).
+	Coverage 127 with an opaque fill takes the overwrite fast path; other coverages
+	blend exactly like blendFillOnlyWPAt: does over an opaque target."
+
+	| base dx dy w h off pixelIndex sIndex cov opaqueWord auxR auxG auxB covAlpha covUnAlpha covR covG covB targetWord |
+	<var: 'cov' type: #'uint8_t'>
+	<var: 'opaqueWord' type: #'uint32_t'>
+	<var: 'auxR' type: #'uint32_t'>
+	<var: 'auxG' type: #'uint32_t'>
+	<var: 'auxB' type: #'uint32_t'>
+	<var: 'targetWord' type: #'uint32_t'>
+	<var: 'covAlpha' type: #float>
+	<var: 'covUnAlpha' type: #float>
+	<var: 'covR' type: #float>
+	<var: 'covG' type: #float>
+	<var: 'covB' type: #float>
+	self
+		primitive: 'primBlendCoverageRunWP'
+		parameters: #(ByteArray WordArray SmallInteger).
+
+	opaqueWord := 0.
+	fillA = 1.0 ifTrue: [
+		auxR := (fillR + 0.5) asInteger bitShift: 16.
+		auxG := (fillG + 0.5) asInteger bitShift: 8.
+		auxB := (fillB + 0.5) asInteger.
+		opaqueWord := ((16rFF000000 bitOr: auxR) bitOr: auxG) bitOr: auxB ].
+	1 to: n do: [ :g |
+		base := g - 1 * 5.
+		dx := metaArray at: base.
+		dy := metaArray at: base + 1.
+		w := metaArray at: base + 2.
+		h := metaArray at: base + 3.
+		off := metaArray at: base + 4.
+		0 to: h - 1 do: [ :row |
+			pixelIndex := (dy + row) * targetWidth + dx.
+			sIndex := off + (row * w).
+			0 to: w - 1 do: [ :col |
+				cov := sheet at: sIndex + col.
+				cov = 0 ifFalse: [
+					(cov = 16r7F and: [opaqueWord ~= 0])
+						ifTrue: [
+							targetBits at: pixelIndex put: opaqueWord.
+							morphIds at: pixelIndex put: currentMorphId ]
+						ifFalse: [
+							covAlpha := cov * (1.0 / 127.0).
+							covAlpha := covAlpha * fillA.
+							covUnAlpha := 1.0 - covAlpha.
+							targetWord := targetBits at: pixelIndex.
+							covR := covAlpha * fillR + (covUnAlpha * ((targetWord bitAnd: 16rFF0000) bitShift: -16)).
+							covG := covAlpha * fillG + (covUnAlpha * ((targetWord bitAnd: 16rFF00) bitShift: -8)).
+							covB := covAlpha * fillB + (covUnAlpha * (targetWord bitAnd: 16rFF)).
+							targetWord := ((16rFF000000 bitOr: ((covR + 0.5) asInteger bitShift: 16)) bitOr: ((covG + 0.5) asInteger bitShift: 8)) bitOr: (covB + 0.5) asInteger.
+							targetBits at: pixelIndex put: targetWord.
+							morphIds at: pixelIndex put: currentMorphId ]].
+				pixelIndex := pixelIndex + 1 ]]]! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blending' stamp: 'ML 2026'!
+blendFillOnlyWPAt: pixelIndex antiAliasAlphaByte: antiAliasAlphaBits
+	"Blends fill color over background.
+	WP: Whole pixel anti aliasing.
+	Target translucency is computed correctly.
+	For blending, alphas are in [0 .. 1.0] and R, G, B color components are in [0 .. 255]"
+	<var: 'antiAliasAlphaBits' type: #'uint8_t'>
+	| targetWord resultR resultG resultB resultRBits resultGBits resultBBits alpha unAlpha targetAlphaBits targetAlpha resultAlpha resultAlphaBits |
+	<var: 'targetWord' type: #'uint32_t'>
+	<var: 'targetAlphaBits' type: #'uint32_t'>
+	<var: 'targetAlpha' type: #float>
+	<var: 'resultRBits' type: #'uint32_t'>
+	<var: 'resultGBits' type: #'uint32_t'>
+	<var: 'resultBBits' type: #'uint32_t'>
+	<var: 'resultAlpha' type: #float>
+	<var: 'resultR' type: #float>
+	<var: 'resultG' type: #float>
+	<var: 'resultB' type: #float>
+	<var: 'alpha' type: #float>
+	<var: 'unAlpha' type: #float>
+	<var: 'resultAlphaBits' type: #'uint32_t'>
+	alpha := antiAliasAlphaBits * (1.0 / 127.0).
+	alpha := alpha * fillA.
+	unAlpha := 1.0 - alpha.
+	targetWord := targetBits at: pixelIndex.
+	targetAlphaBits := targetWord bitAnd: 16rFF000000.
+	resultRBits := targetWord bitAnd: 16rFF0000.
+	resultGBits := targetWord bitAnd: 16rFF00.
+	resultBBits := targetWord bitAnd: 16rFF.
+	targetAlphaBits = 16rFF000000 ifTrue: [
+		"Opaque target pixel: targetAlpha computes to exactly 1.0, and
+		alpha + (unAlpha * 1.0) rounds to exactly 1.0 for every float alpha
+		in [0..1] (verified exhaustively over all 2^30 such floats). The
+		three divides and three multiplies by these values are IEEE
+		identities, so skipping them is bit-identical to the general path.
+		This is the universal case when drawing to the live Display."
+		resultR := alpha * fillR + (unAlpha * (resultRBits bitShift: -16)).
+		resultG := alpha * fillG + (unAlpha * (resultGBits bitShift: -8)).
+		resultB := alpha * fillB + (unAlpha * resultBBits).
+		resultRBits := (resultR + 0.5) asInteger bitShift: 16.
+		resultGBits := (resultG + 0.5) asInteger bitShift: 8.
+		resultBBits := (resultB + 0.5) asInteger.
+		targetWord := ((16rFF000000 bitOr: resultRBits) bitOr: resultGBits) bitOr: resultBBits.
+		targetBits at: pixelIndex put: targetWord.
+		morphIds at: pixelIndex put: currentMorphId.
+		^ 0 ].
+	targetAlpha := targetAlphaBits * ( 1.0 / (255.0 * 256 * 256 * 256)).
+	resultAlpha := alpha + (unAlpha * targetAlpha).
+	resultR := alpha * fillR + (unAlpha * (resultRBits bitShift: -16) * targetAlpha).
+	resultG := alpha * fillG + (unAlpha * (resultGBits bitShift: -8) * targetAlpha).
+	resultB := alpha * fillB + (unAlpha * resultBBits * targetAlpha).
+	resultAlphaBits := (resultAlpha * 255 + 0.5) asInteger bitShift: 24.
+	resultRBits := (resultR / resultAlpha + 0.5) asInteger bitShift: 16.
+	resultGBits := (resultG / resultAlpha + 0.5) asInteger bitShift: 8.
+	resultBBits := (resultB / resultAlpha + 0.5) asInteger.
+	targetWord := ((resultAlphaBits bitOr: resultRBits) bitOr: resultGBits) bitOr: resultBBits.
+	targetBits at: pixelIndex put: targetWord.
+	morphIds at: pixelIndex put: currentMorphId.! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blending' stamp: 'ML 2026'!
+blendStrokeOnlyWPAt: pixelIndex antiAliasAlphaByte: strokeAntiAliasAlphaBits
+	"Blends stroke color over background.
+	WP: Whole pixel anti aliasing.
+	Target translucency is computed correctly.
+	For blending, alphas are in [0 .. 1.0] and R, G, B color components are in [0 .. 255]"
+	<var: 'strokeAntiAliasAlphaBits' type: #'uint8_t'>
+	| targetWord resultR resultG resultB resultRBits resultGBits resultBBits alpha unAlpha targetAlphaBits targetAlpha resultAlpha resultAlphaBits |
+	<var: 'targetWord' type: #'uint32_t'>
+	<var: 'targetAlphaBits' type: #'uint32_t'>
+	<var: 'targetAlpha' type: #float>
+	<var: 'resultRBits' type: #'uint32_t'>
+	<var: 'resultGBits' type: #'uint32_t'>
+	<var: 'resultBBits' type: #'uint32_t'>
+	<var: 'resultAlpha' type: #float>
+	<var: 'resultR' type: #float>
+	<var: 'resultG' type: #float>
+	<var: 'resultB' type: #float>
+	<var: 'alpha' type: #float>
+	<var: 'unAlpha' type: #float>
+	<var: 'resultAlphaBits' type: #'uint32_t'>
+	alpha := strokeAntiAliasAlphaBits * (1.0 / 127.0).
+	alpha := alpha * strokeA.
+	unAlpha := 1.0 - alpha.
+	targetWord := targetBits at: pixelIndex.
+	targetAlphaBits := targetWord bitAnd: 16rFF000000.
+	resultRBits := targetWord bitAnd: 16rFF0000.
+	resultGBits := targetWord bitAnd: 16rFF00.
+	resultBBits := targetWord bitAnd: 16rFF.
+	targetAlphaBits = 16rFF000000 ifTrue: [
+		"Opaque target pixel: see blendFillOnlyWPAt:antiAliasAlphaByte: --
+		the skipped divides and multiplies are IEEE identities here."
+		resultR := alpha * strokeR + (unAlpha * (resultRBits bitShift: -16)).
+		resultG := alpha * strokeG + (unAlpha * (resultGBits bitShift: -8)).
+		resultB := alpha * strokeB + (unAlpha * resultBBits).
+		resultRBits := (resultR + 0.5) asInteger bitShift: 16.
+		resultGBits := (resultG + 0.5) asInteger bitShift: 8.
+		resultBBits := (resultB + 0.5) asInteger.
+		targetWord := ((16rFF000000 bitOr: resultRBits) bitOr: resultGBits) bitOr: resultBBits.
+		targetBits at: pixelIndex put: targetWord.
+		morphIds at: pixelIndex put: currentMorphId.
+		^ 0 ].
+	targetAlpha := targetAlphaBits * ( 1.0 / (255.0 * 256 * 256 * 256)).
+	resultAlpha := alpha + (unAlpha * targetAlpha).
+	resultR := alpha * strokeR + (unAlpha * (resultRBits bitShift: -16) * targetAlpha).
+	resultG := alpha * strokeG + (unAlpha * (resultGBits bitShift: -8) * targetAlpha).
+	resultB := alpha * strokeB + (unAlpha * resultBBits * targetAlpha).
+	resultAlphaBits := (resultAlpha * 255 + 0.5) asInteger bitShift: 24.
+	resultRBits := (resultR / resultAlpha + 0.5) asInteger bitShift: 16.
+	resultGBits := (resultG / resultAlpha + 0.5) asInteger bitShift: 8.
+	resultBBits := (resultB / resultAlpha + 0.5) asInteger.
+	targetWord := ((resultAlphaBits bitOr: resultRBits) bitOr: resultGBits) bitOr: resultBBits.
+	targetBits at: pixelIndex put: targetWord.
+	morphIds at: pixelIndex put: currentMorphId.! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blending' stamp: 'ML 2026'!
+clearAffectedSpanFrom: firstSegment max: maxSegments
+	"Count how many consecutive 16-pixel segments starting at firstSegment are
+	completely clear (affectedBits zero), up to maxSegments. Gang-checks eight
+	segment flags per uint64 load so blend passes can hop empty space at
+	~128 px per compare instead of 16."
+	| n chunk |
+	<var: 'chunk' type: #'usqLong'>
+	<inline: false>
+	n := 0.
+	chunk := 0.
+	[n + 8 <= maxSegments
+	 and: [self cCode: '(memcpy(&chunk, affectedBits + firstSegment + n, 8), chunk == 0)'
+			inSmalltalk: [chunk = 0]]]
+		whileTrue: [ n := n + 8 ].
+	[n < maxSegments and: [(affectedBits at: firstSegment + n) = 0]]
+		whileTrue: [ n := n + 1 ].
+	^ n! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - text and multi paths' stamp: 'ML 2026'!
+clearMaskWPLeft: l top: t right: r bottom: b
+	"Clear stamped coverage state (alphaMaskWP, edgeCountsWP, affectedBits) over
+	a pixel rect, so a caller that only rasterized to read coverage back (glyph
+	tile baking) leaves no residue for the next blend. affectedBits flags are
+	cleared only for segments FULLY inside the rect: an edge segment may still
+	carry data from neighbouring stamps, so its flag must survive (a set flag
+	over clean bytes is harmless; a cleared flag over live bytes loses them)."
+	| lc tc rc bc w pixelIndex firstSeg lastSeg |
+	self
+		primitive: 'primClearMaskWP'
+		parameters: #(SmallInteger SmallInteger SmallInteger SmallInteger).
+	lc := l max: 0.
+	tc := t max: 0.
+	rc := r min: targetWidth - 1.
+	bc := b min: targetHeight - 1.
+	(rc >= lc and: [bc >= tc]) ifTrue: [
+		w := rc - lc + 1.
+		tc to: bc do: [ :displayY |
+			pixelIndex := displayY * targetWidth + lc.
+			self cCode: 'memset(alphaMaskWP + pixelIndex, 0, w)'
+				inSmalltalk: [ pixelIndex to: pixelIndex + w - 1 do: [ :i | alphaMaskWP at: i put: 0 ]].
+			self cCode: 'memset(edgeCountsWP + pixelIndex, 0, w)'
+				inSmalltalk: [ pixelIndex to: pixelIndex + w - 1 do: [ :i | edgeCountsWP at: i put: 0 ]].
+			firstSeg := pixelIndex + 15 >> 4.
+			lastSeg := (pixelIndex + w >> 4) - 1.
+			firstSeg to: lastSeg do: [ :seg |
+				affectedBits at: seg put: 0 ]]]! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - setup' stamp: 'ML 2026'!
 targetBits: aBitmap morphIds: aWordArray edgeCountsWP: otherByteArray alphaMaskWP: anotherByteArray affectedBits: affectedBitsBA contour: aFloat32Array targetWidth: aNumber targetHeight: otherNumber
 
 	self
@@ -78,7 +671,7 @@ targetBits: aBitmap morphIds: aWordArray edgeCountsWP: otherByteArray alphaMaskW
 	dirtyMinY := targetHeight.
 	dirtyMaxY := -1.! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 2026'!
 journalDirtyRow: displayY from: xLeft to: xRight
 	"Record that a stamper touched row displayY between xLeft and xRight (inclusive),
 	widening the row's dirty span. Over-approximation is safe (blends sweep clean
@@ -89,7 +682,7 @@ journalDirtyRow: displayY from: xLeft to: xRight
 	displayY < dirtyMinY ifTrue: [ dirtyMinY := displayY ].
 	displayY > dirtyMaxY ifTrue: [ dirtyMaxY := displayY ]! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 7/4/2026 21:30'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 2026'!
 initializePath
 	self
 		primitive: 'primInitializePath'
@@ -113,7 +706,7 @@ initializePath
 		dirtyMinY := targetHeight.
 		dirtyMaxY := -1 ].! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - stamping alpha values' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - stamping alpha values' stamp: 'ML 2026'!
 updateAlphasWPForX: x y: y
 	
 	"In a basic implementation, this method computes anti aliasing translucency for all possibly affected pixels as determined by
@@ -183,7 +776,7 @@ updateAlphasWPForX: x y: y
 								alphaMaskWP at: pixelIndex put: candidateAlpha ]]]]]].
 	needsFullAlphaCircle := false.! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - stamping alpha values' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - stamping alpha values' stamp: 'ML 2026'!
 updateAlphasWPZeroStrokeForX: x y: y
 	"Optimization.
 	Assumptions:
@@ -291,7 +884,7 @@ updateAlphasWPZeroStrokeForX: x y: y
 							affectedBits at: affectedBitsIndex2 put: 1 ]].
 					alphaMaskWP at: pixelIndex+1 put: candidateAlpha ]]]].! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - stamping alpha values' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - stamping alpha values' stamp: 'ML 2026'!
 updateEdgeCountWPAtX: x y: y
 	"Compute edges intersecting with this horizontal line, for fills."
 
@@ -336,7 +929,7 @@ updateEdgeCountWPAtX: x y: y
 		(affectedBits at: affectedBitsIndex) = 1 ifFalse: [
 			affectedBits at: affectedBitsIndex put: 1 ]].! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - path algorithms' stamp: 'ML 2026'!
 slabStampSegmentWPFromX: x0 y: y0 toX: x1 y: y1
 	"Stamp stroke coverage for a whole (already transformed) segment in ONE pass, computing
 	the exact distance from each affected pixel to the segment, instead of stamping a distance
@@ -453,7 +1046,7 @@ slabStampSegmentWPFromX: x0 y: y0 toX: x1 y: y1
 							alphaMaskWP at: pixelIndex put: candidateAlpha ]]]]]].
 	needsFullAlphaCircle := false.! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - text and multi paths' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - text and multi paths' stamp: 'ML 2026'!
 stampCoverageRunWP: sheet meta: metaArray count: n
 	"Stamp n cached coverage tiles (glyphs) into alphaMaskWP (max-combine, like the
 	regular stampers) instead of compositing directly, so the caller's normal blend
@@ -503,7 +1096,7 @@ stampCoverageRunWP: sheet meta: metaArray count: n
 						alphaMaskWP at: pixelIndex put: cov ]].
 				pixelIndex := pixelIndex + 1 ]]]]! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blend stroke and fill' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blend stroke and fill' stamp: 'ML 2026'!
 blendFillOnlyWPLeft: l top: t right: r bottom: b
 	"Blends fill color over background.
 	WP: Whole pixel anti aliasing.
@@ -743,7 +1336,7 @@ blendFillOnlyWPLeft: l top: t right: r bottom: b
 
 		clippingSpecIndex := clippingSpecIndex + 2 ].! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blend stroke and fill' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blend stroke and fill' stamp: 'ML 2026'!
 blendStrokeOnlyWPLeft: l top: t right: r bottom: b
 	"Blends stroke color over background.
 	WP: Whole pixel anti aliasing.
@@ -845,7 +1438,7 @@ blendStrokeOnlyWPLeft: l top: t right: r bottom: b
 
 		clippingSpecIndex := clippingSpecIndex + 2 ].! !
 
-!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blend stroke and fill' stamp: 'ML 7/4/2026 20:00'!
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - blend stroke and fill' stamp: 'ML 2026'!
 blendStrokeAndFillWPLeft: l top: t right: r bottom: b
 	"Blends stroke color and fill color over background.
 	Do an appropriate (anti aliased) gradient between stoke color and fill color (or pick just stroke or just fill). Blend this over background.
@@ -1130,3 +1723,165 @@ blendStrokeAndFillWPLeft: l top: t right: r bottom: b
 						pixelIndex := pixelIndex + aux1 ]]] ] ].
 
 		clippingSpecIndex := clippingSpecIndex + 2 ].! !
+
+!VectorEnginePlugin methodsFor: 'whole pixel anti aliased - text and multi paths' stamp: 'ML 2026'!
+blendStampedCoverageRunWP: sheet meta: metaArray count: n
+	"Fused stamp+blend for n cached coverage tiles (glyphs). See the change set
+	comment: bit-identical to stampCoverageRunWP: followed by finishPath''s
+	blendFillOnlyWPLeft: for runs of non-overlapping tiles.
+	metaArray holds 5 words per tile: destX destY w h sheetOffset."
+
+	| l r base dx dy w h off rowStart rowEnd colStart colEnd pixelIndex sIndex cov clippingSpecL clippingSpecR antiAliasedClippedLeftPixel antiAliasedClippedRightPixel mustResetColor realFillAlpha displayX opaqueFillColorWord auxR auxG auxB rowSafe covAlpha covUnAlpha covR covG covB targetWord |
+	<var: 'cov' type: #'uint8_t'>
+	<var: 'realFillAlpha' type: #float>
+	<var: 'opaqueFillColorWord' type: #'uint32_t'>
+	<var: 'covAlpha' type: #float>
+	<var: 'covUnAlpha' type: #float>
+	<var: 'covR' type: #float>
+	<var: 'covG' type: #float>
+	<var: 'covB' type: #float>
+	<var: 'targetWord' type: #'uint32_t'>
+	<var: 'auxR' type: #'uint32_t'>
+	<var: 'auxG' type: #'uint32_t'>
+	<var: 'auxB' type: #'uint32_t'>
+	self
+		primitive: 'primBlendStampedCoverageRunWP'
+		parameters: #(ByteArray WordArray SmallInteger).
+
+	"Clipped bounding box of the whole run: the anti-aliased clip columns must be
+	judged against the same l..r the two-pass blend would have used."
+	l := targetWidth.
+	r := 0.
+	1 to: n do: [ :g |
+		base := g - 1 * 5.
+		dx := metaArray at: base.
+		w := metaArray at: base + 2.
+		dx < l ifTrue: [ l := dx ].
+		dx + w - 1 > r ifTrue: [ r := dx + w - 1 ]].
+	l < clipLeft ifTrue: [ l := clipLeft ].
+	r > clipRight ifTrue: [ r := clipRight ].
+
+	mustResetColor := false.
+	realFillAlpha := fillA.
+	"Same opaque shortcut recipe as the blends. For cov = 127 with an opaque fill
+	over an opaque target, blendFillOnlyWPAt: computes alpha = 127 * (1/127) * 1.0
+	which rounds to exactly 1.0 (double math assigned to float), unAlpha = 0.0, and
+	the result word equals this opaqueFillColorWord bit for bit -- so the direct
+	overwrite below is an exact shortcut, not an approximation."
+	opaqueFillColorWord := 0.
+	targetAssumedOpaque ifTrue: [
+		fillA = 1.0 ifTrue: [
+			auxR := (fillR + 0.5) asInteger bitShift: 16.
+			auxG := (fillG + 0.5) asInteger bitShift: 8.
+			auxB := (fillB + 0.5) asInteger.
+			opaqueFillColorWord := ((16rFF000000 bitOr: auxR) bitOr: auxG) bitOr: auxB ]].
+	1 to: n do: [ :g |
+		base := g - 1 * 5.
+		dx := metaArray at: base.
+		dy := metaArray at: base + 1.
+		w := metaArray at: base + 2.
+		h := metaArray at: base + 3.
+		off := metaArray at: base + 4.
+		"honor the clip rect: composite only the visible part of the tile"
+		rowStart := dy max: clipTop.
+		rowEnd := dy + h - 1 min: clipBottom.
+		colStart := dx max: clipLeft.
+		colEnd := dx + w - 1 min: clipRight.
+		(rowEnd >= rowStart and: [colEnd >= colStart]) ifTrue: [
+			colStart < spanLeft ifTrue: [ spanLeft := colStart ].
+			rowStart < spanTop ifTrue: [ spanTop := rowStart ].
+			colEnd + 1 > spanRight ifTrue: [ spanRight := colEnd + 1 ].
+			rowEnd + 1 > spanBottom ifTrue: [ spanBottom := rowEnd + 1 ].
+			rowStart to: rowEnd do: [ :rowY |
+				clippingSpecL := 0.
+				clippingSpecR := targetWidth - 1.
+				antiAliasedClippedLeftPixel := targetWidth."targetWidth means effectively no AA for clipping"
+				antiAliasedClippedRightPixel := targetWidth."targetWidth means effectively no AA for clipping"
+				clippingSpec ifNotNil: [
+					clippingSpecL := clippingSpec at: rowY * 2.
+					clippingSpecR := clippingSpec at: rowY * 2 + 1.
+					antiAliasedClippedLeftPixel := clippingSpecL >= l ifTrue: [clippingSpecL] ifFalse: [targetWidth].
+					antiAliasedClippedRightPixel := clippingSpecR <= r ifTrue: [clippingSpecR] ifFalse: [targetWidth]].
+				pixelIndex := rowY * targetWidth + colStart.
+				sIndex := off + ((rowY - dy) * w) + (colStart - dx).
+				displayX := colStart.
+				"Fast row: whole tile row inside the clip window and clear of the four
+				anti-aliased clip columns (the usual case for text inside a pane) --
+				no per-pixel window checks, and cov = 127 with an opaque fill takes
+				the exact overwrite shortcut justified above."
+				rowSafe := (colStart >= clippingSpecL and: [colEnd <= clippingSpecR])
+					and: [(antiAliasedClippedLeftPixel + 1 < colStart or: [antiAliasedClippedLeftPixel > (colEnd + 1)])
+					and: [(antiAliasedClippedRightPixel + 1 < colStart or: [antiAliasedClippedRightPixel > (colEnd + 1)])]].
+				rowSafe
+					ifTrue: [
+						[ displayX <= colEnd ] whileTrue: [
+							cov := sheet at: sIndex.
+							cov = 0 ifFalse: [
+								(cov = 16r7F and: [opaqueFillColorWord ~= 0])
+									ifTrue: [
+										targetBits at: pixelIndex put: opaqueFillColorWord.
+										morphIds at: pixelIndex put: currentMorphId ]
+									ifFalse: [
+										targetWord := targetBits at: pixelIndex.
+										(targetWord bitAnd: 16rFF000000) = 16rFF000000
+											ifTrue: [
+												"blendFillOnlyWPAt:antiAliasAlphaByte:''s opaque-target
+												branch, inlined expression for expression"
+												covAlpha := cov * (1.0 / 127.0).
+												covAlpha := covAlpha * fillA.
+												covUnAlpha := 1.0 - covAlpha.
+												covR := covAlpha * fillR + (covUnAlpha * ((targetWord bitAnd: 16rFF0000) bitShift: -16)).
+												covG := covAlpha * fillG + (covUnAlpha * ((targetWord bitAnd: 16rFF00) bitShift: -8)).
+												covB := covAlpha * fillB + (covUnAlpha * (targetWord bitAnd: 16rFF)).
+												targetWord := ((16rFF000000 bitOr: ((covR + 0.5) asInteger bitShift: 16)) bitOr: ((covG + 0.5) asInteger bitShift: 8)) bitOr: (covB + 0.5) asInteger.
+												targetBits at: pixelIndex put: targetWord.
+												morphIds at: pixelIndex put: currentMorphId ]
+											ifFalse: [
+												self blendFillOnlyWPAt: pixelIndex antiAliasAlphaByte: cov ]]].
+							displayX := displayX + 1.
+							pixelIndex := pixelIndex + 1.
+							sIndex := sIndex + 1 ]]
+					ifFalse: [
+						[ displayX <= colEnd ] whileTrue: [
+							cov := sheet at: sIndex.
+							cov = 0 ifFalse: [
+								(displayX >= clippingSpecL and: [ displayX <= clippingSpecR ]) ifTrue: [
+									(displayX = antiAliasedClippedLeftPixel or: [ displayX = antiAliasedClippedRightPixel ])
+										ifTrue: [
+											fillA := fillA * 0.25. mustResetColor := true ]
+										ifFalse: [
+											(displayX - 1 = antiAliasedClippedLeftPixel or: [ displayX + 1 = antiAliasedClippedRightPixel ]) ifTrue: [
+												fillA := fillA * 0.75. mustResetColor := true ]].
+									self blendFillOnlyWPAt: pixelIndex antiAliasAlphaByte: cov.
+									mustResetColor ifTrue: [
+										fillA := realFillAlpha. mustResetColor := false ]]].
+							displayX := displayX + 1.
+							pixelIndex := pixelIndex + 1.
+							sIndex := sIndex + 1 ]]]]]! !
+
+!VectorEnginePlugin class methodsFor: 'translation' stamp: 'ML 2026'!
+declareCVarsIn: aCCodeGenerator
+
+
+	aCCodeGenerator addHeaderFile: '<stdint.h>'.
+	aCCodeGenerator addHeaderFile: '<stdlib.h>'.
+	aCCodeGenerator var: 'targetBits' type: 'uint32_t *'.
+	aCCodeGenerator var: 'morphIds' type: 'uint32_t *'.
+	aCCodeGenerator var: 'edgeCounts' type: 'uint32_t *'.
+	aCCodeGenerator var: 'edgeCountsWP' type: 'uint8_t *'.
+	aCCodeGenerator var: 'alphaMask' type: 'uint32_t *'.
+	aCCodeGenerator var: 'alphaMaskWP' type: 'uint8_t *'.
+	aCCodeGenerator var: 'affectedBits' type: 'uint8_t *'.
+	aCCodeGenerator var: 'contour' type: 'float *'.
+	aCCodeGenerator var: 'currentMorphId' type: 'uint32_t'.
+	aCCodeGenerator var: 'clippingSpec' type: 'int *'.
+	"Dirty-span journal: per-row stamped x-extent, plugin-internal (see class comment
+	of the v8 change set). Static NULL/0 initialization is correct: the set-target
+	primitive allocates and initializes before any stamper can run."
+	aCCodeGenerator var: 'dirtyLeftJ' type: 'int *'.
+	aCCodeGenerator var: 'dirtyRightJ' type: 'int *'.
+	aCCodeGenerator var: 'dirtyRowsAllocated' type: 'int'.
+	aCCodeGenerator var: 'dirtyMinY' type: 'int'.
+	aCCodeGenerator var: 'dirtyMaxY' type: 'int'.
+	#(antiAliasingWidth subPixelDelta hop strokeWidth strokeR strokeG strokeB strokeA dashBitLength fillR fillG fillB fillA txA11 txA12 txA13 txA21 txA22 txA23 auxAntiAliasingWidthScaledInverse auxStrokeWidthDilatedHalf auxStrokeWidthDilatedHalfSquared auxStrokeWidthErodedHalfSquared spanLeft spanTop spanRight spanBottom leftAtThisY rightAtThisY trajectoryLength) do: [ :varName |
+		aCCodeGenerator var: varName type: 'float' ].! !

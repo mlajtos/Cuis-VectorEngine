@@ -27,7 +27,7 @@ From this directory, run `generate.st` in the VMMaker image:
 Squeak <the-saved-VMMaker>.image generate.st
 ```
 
-It files in `../slang/SlabStamping5.st` … `SlabStamping9.st` in order, runs
+It files in `../slang/SlabStamping.st`, runs
 `VectorEnginePlugin translateInDirectory:doInlining:`, and writes
 `gen/VectorEnginePlugin.c`. Diff it against `../generated/VectorEnginePlugin.c`
 (they should match modulo the VMMaker/compiler version banner), then promote it.

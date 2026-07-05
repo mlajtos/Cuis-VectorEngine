@@ -17,8 +17,7 @@ CCodeGenerator compile: 'logger
 		ifTrue: [Transcript]
 		ifFalse: [logger]' classified: '*vmmaker-compatibility'.
 [[[[
-	#('SlabStamping5.st' 'SlabStamping6.st' 'SlabStamping7.st' 'SlabStamping8.st' 'SlabStamping9.st')
-		do: [:f | (FileStream readOnlyFileNamed: base, f) fileIn].
+	(FileStream readOnlyFileNamed: base, 'SlabStamping.st') fileIn.
 	log nextPutAll: 'slang filed in'; cr; flush.
 	dir := FileDirectory default directoryNamed: 'gen'.
 	dir assureExistence.
