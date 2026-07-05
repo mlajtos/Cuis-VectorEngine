@@ -15,18 +15,21 @@ C), exactly like the upstream plugin — `slang/SlabStamping.st` is the source o
 
 ## What you get
 
-Directly measured against the plugin Cuis ships, same VM, same image, on a stroke-heavy
-offscreen benchmark (`StrokeStorm`):
+The [`benchmark/`](benchmark/) suite — strokes, beziers, fills, text — measured as VM
+CPU-time on an idle machine, with the pristine plugin and this build **both compiled from
+Slang at `-O2`** so the comparison isolates the algorithm, not the compiler:
 
-| VectorEnginePlugin | strokes/s |
-|---|---|
-| stock (Cuis 7.x) | 22 fps |
-| this build | **58 fps** — ~2.6× |
+| | pristine | this build | speedup |
+|---|--:|--:|--:|
+| strokes (hairlines) | 509 ms | 208 ms | 2.4× |
+| fills | 23–35 ms | 16–22 ms | ~1.5× |
+| **text** | 69–110 ms | 6–12 ms | **9–11×** |
+| **whole suite** | **843 ms** | **346 ms** | **2.4×** |
 
-The gain is algorithmic (see [techniques](#what-makes-it-faster)), not a compiler flag:
-**Cuis already ships the plugin as an optimized external bundle**, so this is 2.6× over
-an already-optimized baseline. With the optional `VectorEngineOpt` package, text drawing
-is a further ~2× from a fused glyph-tile path.
+The gain is algorithmic (see [techniques](#what-makes-it-faster)), **not** a compiler
+flag: Cuis already ships the plugin as an optimized external bundle, so this is 2.4× over
+an already-optimized baseline. The outsized text win is the `VectorEngineOpt` glyph-tile
+cache. Full per-workload table and methodology in [`benchmark/README.md`](benchmark/README.md).
 
 ---
 
@@ -105,7 +108,7 @@ pixel-for-pixel identical — no image changes required.
 
 - a **glyph-tile cache** and a **fused text path** — each `(font, size, glyph,
   sub-pixel phase)` rasterizes once, then whole runs composite as cached coverage tiles.
-  ~2× on text drawing. These call prims this build adds (`primStampCoverageRunWP`,
+  ~9–11× on text drawing. These call prims this build adds (`primStampCoverageRunWP`,
   `primBlendStampedCoverageRunWP`, `primClearMaskWP`, `primExtractCoverageWP`), so they
   need **this** plugin, not the stock one.
 - a **fast `opaqueImage:at:`** — a rule-3 morph-ids clear (11× faster than the rule-0
@@ -124,7 +127,7 @@ every hop, so each pixel is visited ~`penWidth·2/hop` times. Instead, for a who
 transformed segment, compute the **exact distance from each affected pixel to the
 segment in one pass** (`slabStampSegmentWP…`) — per-scanline x-interval, analytic
 point-to-segment distance, round caps falling out of the endpoint branches. Same alpha
-function, a fraction of the work. This is most of the 2.6×.
+function, a fraction of the work. This carries the ~2.4× on stroke-heavy scenes.
 
 **Fills — bulk interior runs.**
 A shape's interior is long runs of fully-covered pixels between anti-aliased edges. The
@@ -163,7 +166,7 @@ blended — three memory passes. The fused path (`blendStampedCoverageRunWP…`)
 the tiles **directly** with the fill color, applying the exact per-pixel treatment (clip
 window, anti-aliased clip columns, span updates) the two-pass path would. Kerned glyphs
 whose *ink* overlaps fall back to the mask path (which max-combines them), so a run is
-partitioned and the result stays bit-identical. ~2× on text.
+partitioned and the result stays bit-identical. With the tile cache this is ~9–11× on text.
 
 **Glyph-tile cache** (`VectorEngineOpt`, image side).
 `GlyphTileCache` bakes each `(font, effective size, glyph, sub-pixel phase)` once through
