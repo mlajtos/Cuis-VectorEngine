@@ -130,9 +130,11 @@ Notes:
   That is what validates *pristine-from-Slang* as the correct stock baseline — the
   benchmark and pixel-diff numbers compare like against like (same compiler, same flags),
   not against Cuis's mystery bundle.
-- The shipped bundle's `__TEXT` is *smaller* (49 KB vs our 64 KB) — it is clearly built
-  with optimization (a newer/tighter toolchain or `-Os`), which is why the main README
-  insists you compile at `-O2`, not `-O0`: you are matching an already-optimized baseline.
+- The shipped bundle's `__TEXT` is *smaller* (49 KB vs our 64 KB) — it is built
+  size-optimized (`-Os`-like), and it benchmarks **~8% slower** than the same source at
+  `-O2` (905 vs 840 ms; see [`../benchmark/`](../benchmark/README.md)). So `-O2` from
+  Slang already edges out what ships before any algorithm change — the pristine baseline
+  is honest, not a straw man.
 - This build and pristine have identical `__TEXT` (64 KB) only because 64 KB is a segment
   alignment boundary both round up to; the actual machine code differs (see LoC below).
 

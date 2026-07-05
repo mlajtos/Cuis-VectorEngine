@@ -11,39 +11,48 @@ Two offscreen `VectorCanvas` benchmarks — no window, no compositor, just the r
 
 ## Results
 
-Same machine (M1), same VM and image, **both plugins compiled from Slang with the repo's
-`build.sh` at `-O2`** so the comparison isolates the algorithm, not the compiler:
+Same machine (M1), same VM and image, all three measured back-to-back in one session
+(best-of-3 ms per workload — the harness takes the fastest of three runs after a warm-up,
+so background load raises times but rarely touches the minimum). Three builds:
 
-- **pristine** — the base `VectorEnginePlugin-jmv.26`, no `VectorEngineOpt`.
-- **this build** — the augmented plugin + the `VectorEngineOpt` package.
+- **shipped stock** — the bundle Cuis actually ships, no published source, universal
+  (x86_64 + arm64), `__TEXT` 49 KB. This is what you run today.
+- **pristine (Slang -O2)** — the base `VectorEnginePlugin-jmv.26` recompiled from Slang
+  with the repo's `build.sh` at `-O2`, no `VectorEngineOpt`. Same algorithm as shipped
+  stock, matched to this build's compiler/flags — the *isolate-the-algorithm* baseline.
+- **this build** — the augmented plugin (`-O2`) + the `VectorEngineOpt` package.
 
-Measured as VM **CPU-time**, on an idle system (wall-clock on a laptop is dominated by
-background load and thermal state — an indexing daemon at 99% inflated an early run 6×;
-CPU-time is immune):
-
-| workload | pristine | this build | speedup |
-|---|--:|--:|--:|
-| hairlines (1px polylines) | 509 ms | 208 ms | 2.4× |
-| wideStrokes (6px) | 52 ms | 43 ms | 1.2× |
-| quadratics | 13 ms | 14 ms | ~1× |
-| cubics | 13 ms | 14 ms | ~1× |
-| fillsOpaque | 23 ms | 16 ms | 1.4× |
-| fillsTrans (blended) | 35 ms | 22 ms | 1.6× |
-| polygons (stroke+fill) | 19 ms | 11 ms | 1.7× |
-| **textPlain** | 69 ms | 6 ms | **11×** |
-| **textDense** | 110 ms | 12 ms | **9×** |
-| **TOTAL (wall)** | **843 ms** | **346 ms** | **2.4×** |
-| TOTAL (VM CPU-time) | 2.65 s | 1.13 s | 2.3× |
+| workload | shipped stock | pristine (Slang -O2) | this build | vs stock |
+|---|--:|--:|--:|--:|
+| hairlines (1px polylines) | 538 ms | 506 ms | 208 ms | **2.6×** |
+| wideStrokes (6px) | 57 ms | 52 ms | 43 ms | 1.3× |
+| quadratics | 13 ms | 13 ms | 14 ms | ~1× |
+| cubics | 13 ms | 13 ms | 14 ms | ~1× |
+| fillsOpaque | 27 ms | 23 ms | 16 ms | 1.7× |
+| fillsTrans (blended) | 43 ms | 35 ms | 22 ms | 2.0× |
+| polygons (stroke+fill) | 21 ms | 19 ms | 11 ms | 1.9× |
+| **textPlain** | 75 ms | 69 ms | 6 ms | **12×** |
+| **textDense** | 118 ms | 110 ms | 11 ms | **11×** |
+| **TOTAL** | **905 ms** | **840 ms** | **345 ms** | **2.6×** |
 
 Reading it:
 
-- **Strokes** carry the plugin win — slab stamping is ~2.4× on hairlines (the worst case
-  for the old per-hop stamper, since thin strokes never saturate the mask).
-- **Fills** gain ~1.4–1.7× from bulk interior runs and the opaque-target fast path.
-- **Beziers** are ~flat here: these curves are short, so flattening dominates and the
-  per-segment slab win is small (and the absolute times are near the noise floor).
-- **Text** is the standout — ~**9–11×** — but that is the `VectorEngineOpt` glyph-tile
+- **vs the shipped bundle** (the honest headline, since it's what people run): **2.6×**
+  overall, ~2.6× on strokes, ~11–12× on text.
+- **Shipped stock is ~8% *slower* than pristine-from-Slang at `-O2`** (905 vs 840) despite
+  its smaller `__TEXT` — it's evidently built size-optimized (`-Os`-like), which trades a
+  little speed for size. So `-O2` from Slang already edges out what ships *before* any
+  algorithm change; the algorithm then does the rest. (This is why `build.sh` uses `-O2`,
+  and why the pristine column exists — it isolates algorithm from compiler.)
+- **Strokes** carry the plugin win — slab stamping is ~2.6× on hairlines (worst case for
+  the old per-hop stamper, since thin strokes never saturate the mask).
+- **Fills** gain ~1.7–2× from bulk interior runs and the opaque-target fast path.
+- **Beziers** are ~flat: these curves are short, so flattening dominates and the
+  per-segment slab win is small (absolute times are near the noise floor — the 14 vs 13 is
+  noise, not a regression).
+- **Text** is the standout — ~**11–12×** — but that is the `VectorEngineOpt` glyph-tile
   cache (bake each glyph once, composite cached tiles), not the plugin alone. With just
-  the plugin bundle and no package, text uses the base outline path.
+  the plugin bundle and no package, text uses the base outline path (and is bit-identical
+  to stock — see [`../validate/`](../validate/#text)).
 
 Numbers are indicative — run the suite on your own hardware, idle, for a clean read.

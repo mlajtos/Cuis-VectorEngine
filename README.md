@@ -25,21 +25,25 @@ C), exactly like the upstream plugin — `slang/SlabStamping.st` is the source o
 
 ## What you get
 
-The [`benchmark/`](benchmark/) suite — strokes, beziers, fills, text — measured as VM
-CPU-time on an idle machine, with the pristine plugin and this build **both compiled from
-Slang at `-O2`** so the comparison isolates the algorithm, not the compiler:
+The [`benchmark/`](benchmark/) suite — strokes, beziers, fills, text — best-of-3 ms on an
+idle M1, all three builds measured back-to-back. **shipped stock** is the bundle Cuis
+actually ships (no source); **pristine** is the same base plugin recompiled from Slang at
+`-O2` (isolates algorithm from compiler); **this build** is the augmented plugin +
+`VectorEngineOpt`:
 
-| | pristine | this build | speedup |
-|---|--:|--:|--:|
-| strokes (hairlines) | 509 ms | 208 ms | 2.4× |
-| fills | 23–35 ms | 16–22 ms | ~1.5× |
-| **text** | 69–110 ms | 6–12 ms | **9–11×** |
-| **whole suite** | **843 ms** | **346 ms** | **2.4×** |
+| | shipped stock | pristine (Slang -O2) | this build | vs stock |
+|---|--:|--:|--:|--:|
+| strokes (hairlines) | 538 ms | 506 ms | 208 ms | **2.6×** |
+| fills | 27–43 ms | 23–35 ms | 16–22 ms | ~1.8× |
+| **text** | 75–118 ms | 69–110 ms | 6–11 ms | **11–12×** |
+| **whole suite** | **905 ms** | **840 ms** | **345 ms** | **2.6×** |
 
 The gain is algorithmic (see [techniques](#what-makes-it-faster)), **not** a compiler
-flag: Cuis already ships the plugin as an optimized external bundle, so this is 2.4× over
-an already-optimized baseline. The outsized text win is the `VectorEngineOpt` glyph-tile
-cache. Full per-workload table and methodology in [`benchmark/README.md`](benchmark/README.md).
+flag. Note the shipped bundle is actually ~8% *slower* than pristine-from-Slang at `-O2`
+(it's built size-optimized), so `-O2` already edges it out before any algorithm change —
+this build is **2.6× over what ships**, 2.4× over the same-flags baseline. The outsized
+text win is the `VectorEngineOpt` glyph-tile cache. Full per-workload table and
+methodology in [`benchmark/README.md`](benchmark/README.md).
 
 ---
 
@@ -91,11 +95,13 @@ On Intel: `ARCH=x86_64 ./build.sh`. Different headers checkout: `OSVM=/path ./bu
 
 ### A note on `-O2`
 
-Cuis ships this plugin as an **external bundle compiled with optimization** (roughly
-`-O2`/`-Os` — its `__TEXT` is *smaller* than an unoptimized build). So `-O2` here is not
-a speedup over stock; it is the level you must match. **Do not build at `-O0`** — the
-rasterizer is a tight per-pixel loop and an `-O0` build is markedly *slower* than the
-stock plugin, erasing the algorithmic gains. `build.sh` uses `-O2`; keep it there.
+Cuis ships this plugin as an **external bundle compiled size-optimized** (`-Os`-like — its
+`__TEXT` is *smaller* than an `-O2` build, and it benchmarks ~8% slower than the same
+source compiled at `-O2`). So `-O2` is not a trick to beat stock; it is simply the right
+level: it matches or slightly edges the shipped bundle before any algorithm change, and
+lets the algorithmic wins land. **Do not build at `-O0`** — the rasterizer is a tight
+per-pixel loop and an `-O0` build is markedly *slower* than the shipped plugin, erasing
+the algorithmic gains. `build.sh` uses `-O2`; keep it there.
 
 ## Using it
 
