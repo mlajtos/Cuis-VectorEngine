@@ -98,7 +98,14 @@ On Intel: `ARCH=x86_64 ./build.sh`. Different headers checkout: `OSVM=/path ./bu
 
 Cuis ships this plugin as an **external bundle compiled size-optimized** (`-Os`-like — its
 `__TEXT` is *smaller* than an `-O2` build, and it benchmarks ~13% slower than the same
-source at `-O3`). `build.sh` uses **`-O3`**, chosen empirically: over `-O2` it is a further
+source at `-O3`). This isn't a mistake — the plugin just inherits **whole-VM build
+defaults, never per-plugin tuning**: the OpenSmalltalk classic build compiles every bundled
+plugin with `-g -Os` (`building/*/common/Makefile.plugin`), and the CMake build uses a
+plain `-O2` (not `-O3`) while knocking the interpreter down to `-O1` and keeping
+`-fno-omit-frame-pointer` for crash backtraces. None of that is chosen for *this*
+rasterizer's hot per-pixel loop — and an external bundle is the only place you can compile
+just this plugin at `-O3` with the frame pointer freed. `build.sh` uses **`-O3`**, chosen
+empirically: over `-O2` it is a further
 ~9% and is **bit-identical** (conforming optimization never reassociates floats — verified
 same-checksum output). **Do not** use `-ffast-math` (it relaxes IEEE, breaking the
 opaque-fast-path identity the correctness proof depends on) or `-O0` (markedly *slower*
