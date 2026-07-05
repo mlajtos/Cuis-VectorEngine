@@ -26,22 +26,23 @@ C), exactly like the upstream plugin — `slang/SlabStamping.st` is the source o
 ## What you get
 
 The [`benchmark/`](benchmark/) suite — strokes, beziers, fills, text — best-of-3 ms on an
-idle M1, all three builds measured back-to-back. **shipped stock** is the bundle Cuis
-actually ships (no source); **pristine** is the same base plugin recompiled from Slang at
-`-O2` (isolates algorithm from compiler); **this build** is the augmented plugin +
-`VectorEngineOpt`:
+idle M1, all three builds measured back-to-back with **only the bench bridge loaded** (no
+application packages — a package that patches a hot rasterizer method skews the baseline;
+see the benchmark README). **shipped stock** is the bundle Cuis actually ships (no source);
+**pristine** is the same base plugin recompiled from Slang at `-O2` (isolates algorithm
+from compiler); **this build** is the augmented plugin + `VectorEngineOpt`:
 
 | | shipped stock | pristine (Slang -O2) | this build | vs stock |
 |---|--:|--:|--:|--:|
-| strokes (hairlines) | 538 ms | 506 ms | 208 ms | **2.6×** |
-| fills | 27–43 ms | 23–35 ms | 16–22 ms | ~1.8× |
-| **text** | 75–118 ms | 69–110 ms | 6–11 ms | **11–12×** |
-| **whole suite** | **905 ms** | **840 ms** | **345 ms** | **2.6×** |
+| strokes (hairlines) | 540 ms | 509 ms | 207 ms | **2.6×** |
+| fills | 28–44 ms | 23–35 ms | 16–22 ms | ~1.9× |
+| **text** | 52–60 ms | 49–57 ms | 5–9 ms | **7–10×** |
+| **whole suite** | **832 ms** | **770 ms** | **340 ms** | **2.4×** |
 
 The gain is algorithmic (see [techniques](#what-makes-it-faster)), **not** a compiler
 flag. Note the shipped bundle is actually ~8% *slower* than pristine-from-Slang at `-O2`
 (it's built size-optimized), so `-O2` already edges it out before any algorithm change —
-this build is **2.6× over what ships**, 2.4× over the same-flags baseline. The outsized
+this build is **2.4× over what ships**, 2.3× over the same-flags baseline. The outsized
 text win is the `VectorEngineOpt` glyph-tile cache. Full per-workload table and
 methodology in [`benchmark/README.md`](benchmark/README.md).
 
@@ -124,7 +125,7 @@ pixel-for-pixel identical — no image changes required.
 
 - a **glyph-tile cache** and a **fused text path** — each `(font, size, glyph,
   sub-pixel phase)` rasterizes once, then whole runs composite as cached coverage tiles.
-  ~9–11× on text drawing. These call prims this build adds (`primStampCoverageRunWP`,
+  ~7–10× on text drawing. These call prims this build adds (`primStampCoverageRunWP`,
   `primBlendStampedCoverageRunWP`, `primClearMaskWP`, `primExtractCoverageWP`), so they
   need **this** plugin, not the stock one.
 - a **fast `opaqueImage:at:`** — a rule-3 morph-ids clear (11× faster than the rule-0
@@ -188,7 +189,7 @@ window, anti-aliased clip columns, span updates) the two-pass path would. Kerned
 whose *ink* overlaps fall back to the mask path (which max-combines them), so a run is
 partitioned. The fused compositing is bit-identical to the two-pass path; the *cache* it
 draws from is what makes cached text visually-equivalent-not-identical to stock (next
-item). With the tile cache this is ~9–11× on text.
+item). With the tile cache this is ~7–10× on text.
 
 **Glyph-tile cache** (`VectorEngineOpt`, image side).
 `GlyphTileCache` bakes each `(font, effective size, glyph, sub-pixel phase)` once through

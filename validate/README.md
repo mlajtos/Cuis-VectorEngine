@@ -19,8 +19,9 @@ numbers and rendered comparisons — so you can judge for yourself.
 The arithmetic-level optimizations layered on top of the rasterizer (opaque-target fast
 path, bulk runs, gang-skip, dirty-span journal) *are* provably bit-identical — see the
 main [README](../README.md#what-makes-it-faster) and `../check_alpha_identity.c`. The
-non-bit-identity comes from **one** thing: exact-distance slab stamping replacing
-hop-sampling.
+non-bit-identity comes from just **two** things: exact-distance slab stamping replacing
+hop-sampling (in the plugin), and — only with `VectorEngineOpt` — the glyph cache snapping
+text to an ⅛-pixel sub-pixel grid (see [Text](#text) below).
 
 ## Rendered comparison
 
@@ -55,7 +56,7 @@ Text has **two** paths, held to different standards:
   quarter-pixel horizontally, half-pixel vertically** (`GlyphTileCache`), then composites
   the nearest cached phase. Stock places each glyph at its exact continuous sub-pixel
   position; snapping to the ≤⅛px grid shifts anti-aliased *edge* coverage slightly. That
-  is the whole difference — and it is what makes the ~9–11× text speedup possible (each
+  is the whole difference — and it is what makes the ~7–10× text speedup possible (each
   glyph rasterizes at most 8 times no matter how often it appears).
 
 `text.st` rendered under stock (outline) vs this build (cached fused tiles):
@@ -132,7 +133,7 @@ Notes:
   not against Cuis's mystery bundle.
 - The shipped bundle's `__TEXT` is *smaller* (49 KB vs our 64 KB) — it is built
   size-optimized (`-Os`-like), and it benchmarks **~8% slower** than the same source at
-  `-O2` (905 vs 840 ms; see [`../benchmark/`](../benchmark/README.md)). So `-O2` from
+  `-O2` (832 vs 770 ms; see [`../benchmark/`](../benchmark/README.md)). So `-O2` from
   Slang already edges out what ships before any algorithm change — the pristine baseline
   is honest, not a straw man.
 - This build and pristine have identical `__TEXT` (64 KB) only because 64 KB is a segment
